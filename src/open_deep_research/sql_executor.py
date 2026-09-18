@@ -41,7 +41,7 @@ async def sql_executor(query: str) -> str:
         if execution failed or the query was not a read-only statement.
     """
     stripped = query.strip().lower()
-    if not (stripped.startswith("select") or stripped.startswith("pragma")):
+    if not stripped.startswith("select"):
         return (
             "SQL Error: only SELECT and PRAGMA statements are permitted. "
             "Write operations are not allowed through this tool."

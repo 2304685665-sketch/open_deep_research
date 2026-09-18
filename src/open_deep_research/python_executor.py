@@ -22,7 +22,7 @@ PYTHON_EXECUTOR_DESCRIPTION = (
     "construct a DataFrame from the result yourself. "
     "Use print() to output what you want to see -- only printed output "
     "is returned to you. "
-    "Only pandas is available; no file system or network access."
+    "Only pandas is available. Note: pandas itself can read local files or network URLs via functions like read_csv/read_pickle/read_json -- avoid using these to access anything outside the data you already have from sql_executor."
 )
 
 
