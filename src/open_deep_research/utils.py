@@ -32,6 +32,8 @@ from tavily import AsyncTavilyClient
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.sql_executor import sql_executor
+from open_deep_research.python_executor import python_executor
 
 ##########################
 # Tavily Search Tool Utils
@@ -594,6 +596,13 @@ async def get_all_tools(config: RunnableConfig):
     mcp_tools = await load_mcp_tools(config, existing_tool_names)
     tools.extend(mcp_tools)
     
+    # DataAnalyst 专精工具：查询内部数据库
+    tools.append(sql_executor)
+    # 注意：python_executor 这里也是加进全局工具列表，
+    # 所有 Researcher 都能看到并调用它，不是只给某个专属角色——
+    # 跟 sql_executor 当初接入时是同一种范围，还没做角色级别的隔离
+    tools.append(python_executor)
+
     return tools
 
 def get_notes_from_tool_calls(messages: list[MessageLikeRepresentation]):
