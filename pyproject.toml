@@ -46,6 +46,7 @@ dependencies = [
     "pandas>=2.3.1",
     "mem0ai>=2.0.20",
     "langgraph-sdk>=0.4.2",
+    "chromadb>=1.5.9",
 ]
 
 [project.optional-dependencies]
