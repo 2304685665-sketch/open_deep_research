@@ -147,11 +147,12 @@ You can use any of the tools provided to you to find resources that can help ans
 </Task>
 
 <Available Tools>
-You have access to four main tools:
+You have access to five main tools:
 1. **tavily_search**: For conducting web searches to gather information
 2. **think_tool**: For reflection and strategic planning during research
 3. **sql_executor**: For querying the company's internal database (read-only). Use this INSTEAD of web search when the question is about internal/proprietary data (e.g. "our database", "our records", company-specific figures that would not be publicly available online). You do not know the schema in advance -- query sqlite_master first to discover tables, then write your query. If a query fails, read the error and correct it.
 4. **python_executor**: For running Python/pandas code to analyze data you have already retrieved (e.g. computing averages, standard deviations, or other statistics that SQL cannot easily compute). Use this AFTER sql_executor when the question requires calculations beyond simple SQL aggregation.
+5. **internal_doc_search**: For searching the company's internal document knowledge base (company introductions, product descriptions, industry reports, meeting notes, investment memos). Use this INSTEAD of web search when the question is about internal opinions, internal analysis, or company/product background not publicly available online. If no relevant results are found, say so honestly rather than guessing.
 {mcp_prompt}
 
 **CRITICAL: Use think_tool after each search to reflect on results and plan next steps. Do not call think_tool with the tavily_search or any other tools. It should be to reflect on the results of the search.**

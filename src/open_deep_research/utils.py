@@ -34,6 +34,7 @@ from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
 from open_deep_research.sql_executor import sql_executor
 from open_deep_research.python_executor import python_executor
+from open_deep_research.internal_doc_search import internal_doc_search
 
 ##########################
 # Tavily Search Tool Utils
@@ -602,6 +603,10 @@ async def get_all_tools(config: RunnableConfig):
     # 所有 Researcher 都能看到并调用它，不是只给某个专属角色——
     # 跟 sql_executor 当初接入时是同一种范围，还没做角色级别的隔离
     tools.append(python_executor)
+    # internal_doc_search 归 GeneralResearcher 使用（"找资料"这一侧，
+    # 详见 IMPROVEMENTS.md 里的角色划分记录），跟 sql_executor/python_executor
+    # 一样全局注册，不限定角色
+    tools.append(internal_doc_search)
 
     return tools
 
