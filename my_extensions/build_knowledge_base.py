@@ -8,6 +8,14 @@
 
 import os
 import chromadb
+from chromadb.utils import embedding_functions
+from dotenv import load_dotenv
+load_dotenv()
+
+openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    model_name="text-embedding-3-small",
+)
 
 KB_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
@@ -60,6 +68,7 @@ def main():
     collection = client.create_collection(
         "company_knowledge_base",
         configuration={"hnsw": {"space": "cosine"}},
+        embedding_function=openai_ef,
     )
 
     all_ids = []
