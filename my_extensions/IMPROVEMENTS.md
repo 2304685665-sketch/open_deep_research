@@ -47,10 +47,23 @@
 - **未覆盖**：模块白名单不等于安全沙箱——没有内存/CPU/执行时间限制，没有真正的进程隔离；`asyncio.to_thread()` 只解决了阻塞事件循环的问题，不提供资源隔离
 - **建议改进**：生产化前需要接入真正的沙箱（Docker容器、E2B等）
 
-### sql_executor 安全边界（P2，Claude Code 已提示）
-- **已覆盖**：只允许 SELECT/PRAGMA 开头，已用测试验证 DELETE 被拒绝（双重验证：拒绝消息 + 数据确实还在）
-- **未覆盖**：危险 PRAGMA（部分 PRAGMA 语句能修改数据库运行时配置，不是绝对只读）、注释前缀绕过检测、数据库文件缺失时的静默失败、并发访问同一 SQLite 文件
-- **建议改进**：如需更保守，可将允许前缀从 select/pragma 收紧为只允许 select，或对 pragma 后续内容做二次白名单匹配
+### sql_executor 安全边界 —— P0-4 已修复（2026-09-18 第二轮审查）
+- **已修复**：Claude Code 用真实脚本实测确认，`PRAGMA user_version=999`/`PRAGMA application_id=1337`/`PRAGMA journal_mode=WAL` 这几类语句能在单条语句内完成对数据库文件的持久性写入，绕过了"只读"的设计假设。修复方式：把允许前缀从 select/pragma 收紧为只允许 select，已用新增的 `test_pragma_now_rejected` 测试验证
+- **缓解因素（同样实测确认，不需要修）**：sqlite3 一次只能执行一条语句，且每次调用都是全新连接，`writable_schema` 这类"需要配合下一条语句才能造成实质破坏"的 PRAGMA，在当前架构下被动挡住了一部分利用链
+- **仍未覆盖**：注释前缀绕过检测、数据库文件缺失时的静默失败、并发访问同一 SQLite 文件
+- **附带发现（功能性小 bug，非安全问题）**：合法的只读 `WITH ... SELECT`（CTE 写法）会被现有前缀检查误判拒绝，因为语句以 "with" 开头，不是 "select"——记录为已知限制，暂不修
+
+### python_executor 安全边界 —— 架构性天花板（2026-09-18 第二轮审查，Claude Code 实测确认）
+- **P0-3 已修复（工具描述层面）**：原描述写"no file system or network access"，Claude Code 实测 `pd.read_pickle`/`pd.read_csv` 能直接读取本地文件（甚至读出了仓库自己的 pyproject.toml），这句承诺是假的。已改成诚实描述，明确告诉模型"pandas 本身有这个能力，但不应该用它访问 sql_executor 已提供数据之外的内容"——这是文字层面的弱引导，不是代码层面的强制拒绝，模型完全可能不遵守
+- **P0-1（已实测确认，未修复，判定为当前架构无法根治）**：pandas 模块是在沙箱外部用普通 `import pandas as pd` 加载的，它自己的模块全局命名空间里保留着真实、未受限的 `__builtins__`。实测 `pd.__builtins__['__import__']` 能绕过我们写的 `restricted_import` 包装，直接拿到真实的 `__import__`，进而访问任意系统模块
+- **P0-2（已实测确认，未修复，判定为当前架构无法根治）**：任何一个被放行的内置类型（`str`/`list`/`int`）都自带完整的对象继承体系，`().__class__.__bases__[0].__subclasses__()` 能枚举到进程里所有已加载的类（实测枚举到 858 个，包含 `subprocess.Popen`），完全不经过 `import` 语句，我们做的所有 `__import__` 白名单限制对这条路径无效。这是 Python 沙箱逃逸里最经典的手法之一
+- **关键结论**：P0-1 和 P0-2 不是"漏了一条规则没写"，是"用 Python 应用层的 `__builtins__`/白名单去限制 `exec()` 执行的代码"这个方案本身的天花板——这是 Python 语言图灵完备的性质决定的，继续在这个方向加更多规则只是在打地鼠。要真正解决，唯一可靠的办法是换成操作系统级别的隔离（独立进程 + 资源限制、容器、专门的沙箱运行时），这是明确的、留给生产化阶段的路线图条目，不是当前阶段能用打补丁方式修好的
+- **推测性风险（Claude Code 已标注置信度，未实测触发）**：`cur.fetchall()` 一次性加载全部结果，无 LIMIT 的笛卡尔积查询理论上可能触发 `MemoryError`，不是 `sqlite3.Error` 的子类，会绕过现有 except 直接向上抛；`while True: pass` 这类死循环会让 `asyncio.to_thread` 的 worker 线程永久挂起（不是异常，是资源耗尽，需要区分对待）；重复触发可能逐步占满默认线程池，影响同进程内其他并发工具调用
+
+### 异常传播机制 —— 已确认不是问题（无需修复）
+- Claude Data Code 用真实脚本验证：`asyncio.to_thread` 包裹的函数抛出的异常，能正确传播到 `await` 处的 `try/except`，不存在"线程内异常被静默吞掉"的问题
+- `sqlite3.OperationalError`（覆盖数据库被占用、磁盘 I/O 错误等）确认是 `sqlite3.Error` 的子类，现有 `except sqlite3.Error` 能正确捕获
+- `python_executor.py` 的 `except Exception` 范围更宽，能捕获线程内几乎所有同步抛出的异常
 
 ### 端到端测试的可观测性限制
 - **问题**：`get_state()` 顶层状态只保留两条消息（提问+报告），子图内部细节不可见；流式接口 `stream_subgraphs` 默认为 False；即使打开也只能看到节点跳转结构，具体 `tool_calls` 字段拿不到
@@ -65,3 +78,16 @@
 - [ ] MCP Server 封装（把已稳定的 SQL/RAG 能力包装成 MCP 工具）
 - [ ] 重复公司名测试（需要先往 demo.db 插入测试数据）
 - [ ] 系统化可靠性测试集的 python_executor 部分（目前只有 sql_executor 有 3 条可靠性测试）
+
+
+## 架构决策：三种能力的角色划分逻辑（2026-09-18）
+
+**划分依据**：不按"内部 vs 外部数据来源"分角色，按"找资料 vs 算数字"这条业务分界线分：
+- **找资料**（语义检索，没有精确数字答案）：网页搜索（已有 tavily_search）+ 内部文档 RAG（待实现）—— 归属 GeneralResearcher
+- **算数字**（结构化查询+计算，有精确答案）：SQL 查询 + Python 统计计算（已有 sql_executor/python_executor）—— 归属 DataAnalyst
+
+**理由**：真实企业场景里，一次研究任务（比如投研/尽调）经常连续问"外部行业情况"→"我们自己的数据库数字"→"我们内部之前的分析文档"，这三类问题是同一个人在同一个任务里连续会问的，不该因为"数据在内部还是外部"这个技术维度被拆成不相关的角色；但"找资料"和"算数字"在解决方式上（语义检索 vs 查询计算）是真正不同的技术路径，值得分开。
+
+**结论**：RAG 归 GeneralResearcher，不影响 DataAnalyst 的职责边界，两件事可以独立排期，RAG 不依赖 DataAnalyst 节点分离先完成。
+
+**排期**：RAG 接入 → RAG 评测验证 → DataAnalyst 代码层面节点分离（见上一条路线图）→ 全链路整合。完成后项目故事线：'找资料（网页+内部文档）+ 算数字（SQL+Python）+ 任务编排（Supervisor 拆分协调）' 三层能力清晰对应真实企业研究场景。
