@@ -71,6 +71,13 @@
 - **当前应对方式**：退回到间接证据交叉验证（最终数字精确匹配 + compress_research 过程描述 + Sources 引用列表点名工具/库名）
 - **未验证**：是否能通过自定义 instrumentation（比如在 `.ainvoke()` 调用处手动加日志/回调）实现结构化断言，这条路径还没有尝试
 
+### RAG 检索实验记录：删除文档开头 chunk 对排序的影响（2026-09-19）
+- **实验目标**：验证删除 Markdown 文档第一个 `##` 标题前的"开头" chunk，是否能改善检索排序
+- **实验结果**：前两个查询的 Top-3 排名基本不变，distance 数值也完全相同；例如第二个查询中 doc03 的 distance 仍为 0.448
+- **实验结果（续）**：第三个查询出现轻微排序变化，但没有明显改善
+- **结论**：当前实验不支持"开头 chunk 是主要检索问题来源"这一假设。不能据此断言该因素对所有查询都没有影响
+- **下一步**：固定文档、切分策略、查询和 Top-k，只更换 Embedding 模型，进行对照测试
+
 ## 待办（尚未开始）
 
 - [ ] mem0 跨会话记忆接入图（已验证 add/search 可用，未接入 deep_researcher 图）
@@ -91,3 +98,11 @@
 **结论**：RAG 归 GeneralResearcher，不影响 DataAnalyst 的职责边界，两件事可以独立排期，RAG 不依赖 DataAnalyst 节点分离先完成。
 
 **排期**：RAG 接入 → RAG 评测验证 → DataAnalyst 代码层面节点分离（见上一条路线图）→ 全链路整合。完成后项目故事线：'找资料（网页+内部文档）+ 算数字（SQL+Python）+ 任务编排（Supervisor 拆分协调）' 三层能力清晰对应真实企业研究场景。
+
+
+### RAG 检索实验记录：距离度量方式（l2 改 cosine）对排序的影响（2026-09-19）
+- 实验目标：验证把 Chroma 默认的 l2 距离度量改成 cosine，是否能改善检索排序
+- 改动方式：create_collection 时传入 configuration={"hnsw": {"space": "cosine"}}，用 Claude Code 实测确认此写法在 chromadb 1.5.9 下有效生效（读取 collection.configuration_json 确认为 cosine），并且是官方推荐的新写法（旧写法是 metadata={"hnsw:space": "cosine"}，两者等效但新写法更规范）
+- 实验结果：distance 数值确实发生了变化（例如 doc03 那条从 0.448 变为 0.224，符合归一化向量下 l2 距离与 cosine 距离的数学换算关系），但四个查询的 Top-3 排序名次完全没有变化
+- 结论：距离度量方式不是导致检索排序不理想的原因。这是第二个被排除的假设（第一个是"开头chunk信息稀薄"）
+- 下一步：两个假设都被排除后，怀疑集中到默认 Embedding 模型（all-MiniLM-L6-v2，主要针对英文训练）本身对中文语义理解能力不足这一点，下一步测试更换为中文友好的 Embedding 模型（本地模型 BAAI/bge-small-zh，或 OpenAI text-embedding-3-small）
