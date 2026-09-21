@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from open_deep_research.memory_manager import save_memory, search_memory, DEMO_USER_ID
 from open_deep_research.configuration import (
     Configuration,
 )
@@ -147,11 +148,30 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
     
     # Step 2: Generate structured research brief from user messages
+    # 先检索这个用户的历史记忆（跨对话的偏好/约束），拼进生成简报的上下文
+    user_messages_text = get_buffer_string(state.get("messages", []))
+    memory_search_result = await search_memory(user_messages_text, user_id=DEMO_USER_ID)
+    remembered_context = ""
+    if memory_search_result["success"] and memory_search_result["memories"]:
+        remembered_items = [m.get("memory", "") for m in memory_search_result["memories"]]
+        remembered_context = (
+            "\n\n[以下是这个用户之前对话中设定过的、可能仍然有效的偏好或约束，"
+            "仅供参考，如果本次提问明确给出了不同的信息，以本次为准]\n"
+            + "\n".join(f"- {item}" for item in remembered_items)
+        )
+
     prompt_content = transform_messages_into_research_topic_prompt.format(
-        messages=get_buffer_string(state.get("messages", [])),
+        messages=user_messages_text + remembered_context,
         date=get_today_str()
     )
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
+
+    # 写记忆：只存这次提问本身的原始文本，不存 research_brief（模型生成的、
+    # 已经转写过的内容）——避免把模型的转述/推断当成"用户说的事实"存下来，
+    # 这次提问文本本身可能包含偏好，也可能不包含，mem0 内部的提炼机制会
+    # 自己判断值不值得存，这里只负责"喂给它这次用户说了什么"这个原始输入，
+    # 不做额外筛选（筛选逻辑交给 mem0 自己的实现，我们不重复造轮子）。
+    await save_memory(user_messages_text, user_id=DEMO_USER_ID)
     
     # Step 3: Initialize supervisor with research brief and instructions
     supervisor_system_prompt = lead_researcher_prompt.format(
