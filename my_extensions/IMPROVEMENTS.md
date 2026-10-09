@@ -4,6 +4,27 @@
 
 ## 已完成
 
+### sql_executor 真实安全漏洞：ATTACH DATABASE 绕过只读保护（2026-10-09，已修复并反向验证）
+
+- **状态**：已修复，已用反向验证确认新测试真的能检测到这个漏洞，未提交（改动在工作区，等待确认后再提交）
+- **发现方式**：在对 `sql_executor.py` 的历次审查中，之前的审查结论写的是"ATTACH 被上层字符串分类器拒绝，不会到达数据库层"，并据此认为"即使字符串检查失效，mode=ro 也是真正的安全边界"这条结论对 ATTACH 同样适用——但这个结论从未被直接验证过，只验证了"经过 `sql_executor` 这一层会被拒绝"。真正的验证方式是绕开分类器，直接在一个独立的临时目录里调用 `se._run_query_sync("ATTACH DATABASE 'evil.db' AS e")`：
+  ```
+  result: Query executed successfully but returned no rows.
+  evil.db exists: True
+  ```
+  这证明此前"mode=ro 是真正的数据库层安全边界"这条结论对 ATTACH 这种攻击方式是不准确的——审查方法本身有缺口：只测了"经过上层分类器"的路径，没有测"假设上层完全失效，数据库层自己扛不扛得住"这个真正要验证的问题。
+- **为什么 `mode=ro` 单独挡不住 ATTACH**：`mode=ro` 是传给 `sqlite3.connect()` 的 URI 参数，只约束"这一个连接对象"打开主数据库文件的方式。`ATTACH DATABASE 'evil.db' AS e` 在 SQLite 里是在同一个连接下**额外打开一个全新的、独立的数据库文件**，这个新文件的打开方式不受连接最初 `mode=ro` 这个参数的约束——相当于 mode=ro 管得住"前门"，但 ATTACH 开的是"后门"，走的是完全不同的路径。额外验证过：单独加 `PRAGMA query_only = ON`（不装下面的 authorizer）也挡不住 ATTACH，`query_only` 只拦截针对（主/已挂载）数据库的写 SQL，不拦截 ATTACH/DETACH 这两个命令本身。
+- **修复方式**：`src/open_deep_research/sql_executor.py` 新增 `_deny_attach_and_detach(action, arg1, arg2, dbname, source)` authorizer 回调，通过 `conn.set_authorizer(_deny_attach_and_detach)` 注册——对 `sqlite3.SQLITE_ATTACH`/`sqlite3.SQLITE_DETACH` 返回 `sqlite3.SQLITE_DENY`，其余动作返回 `sqlite3.SQLITE_OK`。这一层在 `cur.execute(query)` 之前完成注册。同时保留/新增 `conn.execute("PRAGMA query_only = ON")` 作为额外的纵深防御（拦截写 SQL，不是这次漏洞的直接修复点，但仍然值得保留）。`_run_query_sync` 的异常捕获从只捕获 `sqlite3.OperationalError` 放宽为 `sqlite3.Error`，因为 authorizer 拒绝时 Python sqlite3 模块抛出的是 `sqlite3.DatabaseError`（`OperationalError` 的父类，不会被原来的窄 except 捕获到）。
+- **反向验证（证明新测试真的有检测能力，不是摆设）**：
+  1. 临时把 `conn.set_authorizer(_deny_attach_and_detach)` 这一行注释掉
+  2. 用一个隔离运行器单独跑 `test_attach_blocked_at_db_layer`（不触发整个测试文件末尾的 `asyncio.run(main())`），**实测确认测试失败**：`AssertionError: 应该以 SQL Error 开头，实际: 'Query executed successfully but returned no rows.'`——失败原因明确证明是 ATTACH 没有被拒绝，不是测试代码本身的问题
+  3. 确认临时目录在断言失败之后依然被 `finally` 块正确清理（`find /tmp -iname evil.db` 无结果）
+  4. 恢复 `conn.set_authorizer(_deny_attach_and_detach)` 这一行（已用 `grep` 确认代码恢复成原样，没有残留任何"TEMP-DISABLED"之类的标记），**实测确认测试重新通过**
+- **最终回归结果（真实运行，非估计）**：`test_sql_executor.py` **20/20 通过**（原19项 + 本次新增 `test_attach_blocked_at_db_layer`）；`test_sql_reliability.py` **3/3 通过**；`git diff --check` 无输出；`demo.db` 确认零改动
+- **结论的边界（不要误读）**：这次修复解决的是"ATTACH/DETACH 创建或访问额外数据库文件"这一条具体路径，**不代表"所有可能的 SQL 安全问题均已排除"**。SQLite 的攻击面远不止 ATTACH 这一种（历史上的审查已经分别排除过布尔盲注式的多语句堆叠、注释绕过、CTE写操作伪装、`load_extension`、`writefile`等路径，且都是逐条独立验证的，不是一次性"证明了安全"）。每一轮审查只能证明"这一轮测过的攻击面是安全的"，不能证明"再也没有其他未知的攻击面"——这条边界本身也适用于本次修复。
+
+## 已完成（此前记录）
+
 ### python_executor 容器化第三轮加固（2026-10-09，审查反馈，已逐一实测验证）
 
 - **状态**：已实现，已用 `pytest` 和脚本两种方式各跑过一次，18/18 全部真实通过
@@ -15,8 +36,6 @@
   5. **测试改为可被 pytest 收集运行**：给每个 `async def test_xxx` 加了 `@pytest.mark.asyncio` 装饰器（项目已有 `pytest-asyncio` 依赖，`asyncio_mode` 是默认的 strict，需要显式标记）；保留了原来 `python3 my_extensions/test_python_executor.py` 脚本直跑的入口（`main()` 仍按顺序 `await` 每个测试函数本身，不受装饰器影响）。**实测**：`uv run pytest my_extensions/test_python_executor.py -v` 收集到 18 个测试，18 passed。
 - **这一轮改动的文件**：仅 `src/open_deep_research/python_executor.py`（新增 `_HeadTailStreamReader` 类、新增 `STDERR_HEAD_BYTES`/`STDERR_TAIL_BYTES` 常量、stderr 读取器替换）和 `my_extensions/test_python_executor.py`（补两个新测试、改写大 stderr 测试、全部测试加 pytest 标记）。`Dockerfile` 未改动。
 - **仍未覆盖（诚实记录）**：并发测试只验证了5个同时调用不串数据，没有测更高并发量下是否会因为宿主机资源或 Docker daemon 本身的限制而排队/失败；`--cap-drop=ALL` 现在验证了"确实把能力位清零"，但仍然没有验证这具体挡住了哪个真实攻击路径（当前镜像没有可用于演示这类攻击的攻击面）。
-
-## 已完成（此前记录）
 
 ### python_executor 容器化（2026-10-09，已用真实容器运行验证，非假设性设计）
 
