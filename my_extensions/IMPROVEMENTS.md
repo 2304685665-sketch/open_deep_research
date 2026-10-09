@@ -1,8 +1,82 @@
 # 项目改进清单（已发现、待办、已修复）
 
-最后更新：2026-09-18
+最后更新：2026-10-09
 
 ## 已完成
+
+### python_executor 容器化第三轮加固（2026-10-09，审查反馈，已逐一实测验证）
+
+- **状态**：已实现，已用 `pytest` 和脚本两种方式各跑过一次，18/18 全部真实通过
+- 这一轮是对第二轮加固的进一步审查反馈，改了 5 件事：
+  1. **确认 docker run 路径不阻塞事件循环**：`_run_in_container` 是纯同步函数（`src/open_deep_research/python_executor.py:299`），所有阻塞操作都在其内部；唯一的卸载点是 `python_executor` 异步工具函数里的 `return await asyncio.to_thread(_run_in_container, code)`（同文件 `:439`）。全文件 `grep` 确认零处使用 `asyncio.create_subprocess_exec`——这是有意选择"同步代码整体丢进线程池"而不是"原生异步子进程API"的设计，没有发现阻塞事件循环的代码路径。
+  2. **stderr 改为 头2KB+尾6KB**（新增 `_HeadTailStreamReader` 类）：之前 stderr 只保留开头，如果大量输出之后才出现真正的异常信息会被截掉；新方案 head/tail 两个区间严格不重叠，中间丢弃。**实测证据**：构造"先写50MB到stderr再raise RuntimeError('boom')"的代码，旧方案下 `boom` 会被截没，新方案下返回结果里确认能看到完整的 `RuntimeError: boom`（返回长度 8316 字符，约等于 2048+6144+提示文字）。stdout 没有改，仍然是只保留开头 20000 字节（两种流用不同策略是有意的，不是遗漏，原因见 `python_executor.py` 模块 docstring）。
+  3. **新增并发测试**：`asyncio.gather` 同时发起 5 次调用，每次返回一个可区分的数字，断言返回顺序和结果一一对应。**实测通过**，没有发现因为共享模块级状态而串数据的问题（每次调用确实都是独立的容器名、独立的 reader 线程实例）。
+  4. **新增 CapEff 验证**：之前"`--cap-drop=ALL` 已加入"只验证了"不影响正常执行"，没有验证它到底挡住了什么。这次直接在容器内读 `/proc/self/status` 的 `CapEff`，**实测确认是 `0000000000000000`**（16个十六进制0，代表没有任何有效 capability），不再只是配置层面的声明。
+  5. **测试改为可被 pytest 收集运行**：给每个 `async def test_xxx` 加了 `@pytest.mark.asyncio` 装饰器（项目已有 `pytest-asyncio` 依赖，`asyncio_mode` 是默认的 strict，需要显式标记）；保留了原来 `python3 my_extensions/test_python_executor.py` 脚本直跑的入口（`main()` 仍按顺序 `await` 每个测试函数本身，不受装饰器影响）。**实测**：`uv run pytest my_extensions/test_python_executor.py -v` 收集到 18 个测试，18 passed。
+- **这一轮改动的文件**：仅 `src/open_deep_research/python_executor.py`（新增 `_HeadTailStreamReader` 类、新增 `STDERR_HEAD_BYTES`/`STDERR_TAIL_BYTES` 常量、stderr 读取器替换）和 `my_extensions/test_python_executor.py`（补两个新测试、改写大 stderr 测试、全部测试加 pytest 标记）。`Dockerfile` 未改动。
+- **仍未覆盖（诚实记录）**：并发测试只验证了5个同时调用不串数据，没有测更高并发量下是否会因为宿主机资源或 Docker daemon 本身的限制而排队/失败；`--cap-drop=ALL` 现在验证了"确实把能力位清零"，但仍然没有验证这具体挡住了哪个真实攻击路径（当前镜像没有可用于演示这类攻击的攻击面）。
+
+## 已完成（此前记录）
+
+### python_executor 容器化（2026-10-09，已用真实容器运行验证，非假设性设计）
+
+- **状态**：已实现并已提交（随第三轮加固一起提交），下方每一条都是真实跑过一次容器得到的结果，不是按接口设计推测的
+- **背景**：下方"python_executor 安全边界 —— 架构性天花板"条目（2026-09-18）已经把结论写死了——Python 应用层的 `__builtins__`/`__import__` 白名单挡不住 `pd.__builtins__` 泄漏和 `__subclasses__()` 枚举这两条逃逸路径，这是 Python 语言本身图灵完备性质决定的天花板，"唯一可靠的办法是换成操作系统级别的隔离（容器）"，当时明确写的是路线图待办，不是已完成项。这次就是把这条路线图待办真正实现。
+- **改动文件**：
+  - 新增 `my_extensions/docker/python_executor/Dockerfile`（最小 `python:3.11-slim` + pandas，非 root 用户，ENTRYPOINT 从 stdin 读代码）
+  - 重写 `src/open_deep_research/python_executor.py`：删除旧的 `ALLOWED_MODULES`/`restricted_import`/`safe_builtins` 白名单机制，改为每次调用起一个一次性容器执行代码
+  - 重写 `my_extensions/test_python_executor.py`：旧的"验证白名单拦截 os"的测试已不适用（os 现在可以被 import，这是预期行为变化，不是回归），换成针对容器隔离边界本身的测试
+- **真实隔离机制**（`docker run` 参数）：`--network none` + `--read-only --tmpfs /tmp` + `--memory=256m --memory-swap=256m`（两者都要设，见下方实测发现）+ `--cpus=0.5` + `--pull=never`（禁止隐式联网拉取镜像）+ 不挂载任何宿主机目录 + 具名容器配合 `docker kill` 实现超时强制终止
+- **实测过程中发现的一个真实坑**：最初只设了 `--memory=256m`，在该限制下分配 1GB 的 `bytearray` 竟然"成功"了——因为 Docker 默认允许 swap 到约 2 倍内存，不单独设 `--memory-swap` 的话内存限制形同虚设。补上 `--memory-swap=256m` 之后，同样的分配立刻被 OOM-kill（exit 137）。这条记录下来是因为它不是设计阶段能想到的坑，是动手测才发现的。
+- **已用真实运行验证的边界**（`my_extensions/test_python_executor.py`，`uv run python3 my_extensions/test_python_executor.py` 全部通过）：
+  - 基础 pandas 计算、无 print 提示、语法错误原样返回 —— 行为与容器化之前一致
+  - **网络隔离**：容器内 `socket.create_connection` 到 `8.8.8.8:53` 真实抛出 `OSError: [Errno 101] Network is unreachable`，不是代码层拦截
+  - **宿主机文件系统隔离**：容器内尝试 `open()` 这个项目在宿主机上的真实绝对路径，得到 `FileNotFoundError`，确认未挂载任何宿主机目录
+  - **os 模块可以被 import，但看到的只是容器自己的环境**：`os.getcwd()` 返回的是容器内的 `/tmp`，不是宿主机路径——这是与旧版本的行为差异（旧版本会在 `__import__` 层拦截并报错），记录为"预期变化"而非"新漏洞"
+  - **超时真正被强制执行**：一个 `while True: time.sleep(1)` 死循环，在限制为 3 秒时实测 3.1 秒内被 `docker kill` 杀掉并返回明确的超时错误——这是对旧版本"没有超时限制，死循环会一直占用资源"这条已知缺口的真实修复，不是声明修复
+  - **内存限制真正被强制执行**：256m 限制下分配 512MB，实测被 OOM-kill（exit 137），返回明确错误，而不是悄悄"成功"
+  - **镜像缺失时报错清晰**：故意把镜像 tag 改成不存在的名字，确认返回的是 docker 原始的 `No such image` 错误文本，不是裸异常或静默失败
+- **新增的运维依赖（诚实记录，不是遗漏）**：
+  - 本机必须安装并运行 Docker——这是全新的硬性依赖，之前的 `exec()` 方案不需要
+  - 镜像必须提前手动 build 好（`docker build -t odr-python-executor:latest my_extensions/docker/python_executor/`），工具本身不会自动 build，`--pull=never` 也刻意禁止了运行时隐式拉取
+  - 每次调用多了约 0.3-1 秒的容器启动延迟，这是用安全性换来的代价
+- **没有覆盖的部分（诚实记录，不是本次任务范围）**：没有限制容器内 PID 数、没有自定义 seccomp profile、没有做真正的多租户资源隔离（比如多个并发调用之间没有做额外的 CPU/IO 配额隔离，只是各自有自己的 `--cpus`/`--memory` 上限）；这些比 P0-1/P0-2 优先级更低，暂未处理
+- **与旧条目的关系**：下方"python_executor 安全边界 —— 架构性天花板"条目的 P0-1/P0-2/P0-3 三点，均已通过本次容器化方案解决，原文保留作为问题发现过程的记录，不做删除
+
+### python_executor 容器化第二轮加固（2026-10-09，审查发现的 5 类问题，已逐一实测验证）
+
+- **状态**：已实现并已提交（随第三轮加固一起提交）。这一轮是对上面"python_executor 容器化"条目的审查反馈——初版容器化解决了网络/文件系统/内存/CPU 隔离，但審查指出了几个更细的工程问题：输出采集方式本身仍有无界内存风险、超时清理没有真正确认、缺少几项常见的纵深防御参数、部分测试对实现细节（退出码、英文错误文案）过度绑定。
+- **改动文件**：`src/open_deep_research/python_executor.py`（重写核心执行逻辑）、`my_extensions/test_python_executor.py`（重写并扩充测试）。`Dockerfile` 本身未改动——这一轮全部是 `docker run` 参数和宿主机侧采集逻辑的调整，不需要改镜像。
+- **问题1：有界输出采集（已修复）**
+  - 原实现用 `subprocess.run(capture_output=True)`，会把子进程全部 stdout/stderr 无上限地攒进内存后再截断字符串——一个打印几十 MB 的循环会先把几十 MB 都搬进 Python 进程内存，截断只是"事后"的字符串切片，不能真正防止内存被占满。
+  - 改为 `subprocess.Popen` + 两个后台线程（`_BoundedStreamReader`）分别持续排空 stdout/stderr：每次 `read()` 一个 4096 字节的 chunk，按字节计数，超过 `MAX_OUTPUT_BYTES`（20000）后不再往缓冲区追加，但**仍然继续读取并丢弃**直到 EOF——这是为了不让子进程因为管道写满而阻塞死锁，不是"读够了就不读了"。解码在全部读完后一次性做，用 `errors="replace"` 处理截断点可能切在多字节 UTF-8 字符中间的情况。
+  - **实测证据**：构造打印约 50MB（50050000 字节）到 stdout 的代码，返回结果被限制到 20071 字符（含截断提示），耗时 0.59 秒；stderr 同理（50000092 字节被限制到 20085 字符）。两条测试都是真实跑出来的数字，不是推算的。
+  - **已知取舍（诚实记录）**：截断保留的是每个流的**开头**部分。如果一段输出先打印大量内容、真正有用的报错信息在最后才出现（比如本次 stderr 压力测试里的 `RuntimeError("boom")`），这条有用信息会被截掉，返回的只是开头的无意义内容。这是"保头不保尾"的已知限制，没有在本轮解决（解决需要环形缓冲/双向截断，复杂度明显上升，暂判定为优先级不够高）。
+- **问题2：超时与清理（已修复）**
+  - 原实现里，`docker kill` 命令本身没有超时，且一旦 `docker kill` 返回就直接假定容器已经停止——但 CLI 命令返回成功只代表 kill 信号被 daemon 接受了，不代表容器进程已经真正退出、`--rm` 已经真正把容器对象移除。
+  - 改为：`docker kill` 本身带 5 秒超时（`CLEANUP_KILL_TIMEOUT`）；之后用 `docker inspect` 做有限轮询（最多 3 秒，`CLEANUP_CONFIRM_TIMEOUT`，每 200ms 一次），只有轮询到 "no such object" 才认为清理被真实确认；轮询超时仍未确认时，返回的错误信息会如实说"could NOT be confirmed"，不会声称清理成功。
+  - **实测证据**：
+    - 正常情况下，`docker kill` 之后几乎立刻（约 100ms 级别）就能被 `docker inspect` 确认为"不存在"，说明 `--rm` 的清理延迟通常很小，但轮询仍然是必要的保险而不是形式主义。
+    - 独立验证（`test_timeout_cleanup_actually_removes_container`）：通过 monkeypatch `uuid.uuid4()` 固定住本次调用生成的容器名，超时之后额外跑一次独立的 `docker ps -a --filter name=<固定名字>`，确认宿主机上真的没有残留——这是跳出被测函数本身、从外部独立观察的验证，不是读函数自己返回的文案。
+    - 故意把 `CLEANUP_CONFIRM_TIMEOUT` 压到 0 来触发"无法确认"分支（`test_cleanup_not_confirmed_is_reported_honestly`），确认此时返回的文案确实是"无法确认"而不是冒称成功——这条测试验证的是诚实失败路径本身是真实存在且可达的，不是靠文档宣称。
+- **问题3：纵深防御参数（已加入，附兼容性说明）**
+  - 新增 `--pids-limit=64`：限制容器内进程/线程总数。**实测**：一个尝试 `os.fork()` 200 次的循环，在第 63 个子进程后收到 `OSError: [Errno 11] Resource temporarily unavailable`，证明限制真实生效，不是摆设。**兼容性风险**：如果未来有需要创建大量子进程/线程的合法用例（本项目目前没有），会被此限制挡住，需要相应调高数值。
+  - 新增 `--cap-drop=ALL`：丢弃所有 Linux capabilities（如 `CAP_NET_RAW`/`CAP_SYS_ADMIN`）。**实测**：基础 pandas 计算在此限制下正常执行，无影响。**兼容性风险**：如果将来镜像里需要任何特权操作（比如 ping 需要 `CAP_NET_RAW`、修改文件属主需要 `CAP_CHOWN`），会直接失败——当前只跑纯 Python/pandas 计算，没有这类需求。
+  - 新增 `--security-opt=no-new-privileges`：禁止通过 setuid/setgid 二进制提权。**兼容性风险**：几乎为零，镜像里没有任何 setuid 程序，这条防的是假设性的、本次没有复现的攻击路径。
+  - `--tmpfs /tmp` 补充显式大小 `size=64m,mode=1777`（之前没有限定大小，默认可能是宿主机内存的较大比例）。**实测**：带显式大小参数的 tmpfs 挂载语法本身可用，基础执行不受影响。
+  - **按要求没有改动**：保留 Docker 默认 seccomp profile，没有传 `--security-opt seccomp=unconfined`，也没有写自定义 profile。
+  - **这一轮新增参数没有做的事**：没有做大规模的兼容性回归（只验证了"不影响当前唯一的 pandas 计算用例"），也没有做破坏性的权限提升尝试去验证 `cap-drop`/`no-new-privileges` 真的挡住了什么（因为当前镜像里没有可以用来验证这类防御的攻击面，比如没有 setuid 二进制），这两项目前只能算"配置上已加"，不能算"已验证真的挡住了什么具体攻击"。
+- **问题4：测试过度依赖实现细节（已修正）**
+  - 内存测试：不再硬性要求退出码必须是 137，也不再要求错误文案包含"memory"一词——改为只断言"预期的成功标记没有出现"+"确实返回了错误"+"耗时很短"，这三条才是真正不变的事实，具体的 OOM 上报机制可能随 Docker/cgroup 版本变化。
+  - 网络测试：不再断言必须出现"Network is unreachable"这句具体英文——改为只断言"连接未成功"+"返回了错误"，避免测试绑死在某个内核/网络栈的具体报错文案上。
+  - 代码里对应地把 exit 137 的解释措辞也软化为"consistent with…but not proof of…"，不再直接声称"肯定是因为超内存"。
+- **问题5：其他健壮性（已检查/已实现）**
+  - Docker daemon 不可达：真实把 `DOCKER_HOST` 指向一个没有监听的端口（不是 mock），确认 0.03 秒内就能拿到明确的 `Cannot connect to the Docker daemon...` 错误，不会挂起。
+  - 镜像缺失：沿用第一轮的验证，确认报错清晰。
+  - 清理失败场景：见问题2，已有专门测试覆盖"无法确认"这条路径。
+  - 新增代码体积上限 `MAX_CODE_BYTES`（64KB）：超限时在**启动容器之前**就直接拒绝，实测 1 毫秒内返回，没有真的起容器——防止用一段几十/几百 MB 的超大代码字符串做资源消耗型滥用。
+  - 按要求没有引入宿主机执行回退，没有挂载任何宿主机目录，没有挂载 Docker socket——这几点在改动前后都成立，这里只是重新确认一次。
+- **诚实的最终措辞**：以上这些参数和机制降低了特定风险类别（资源耗尽、输出内存膨胀、清理状态不明）的发生概率和影响范围，**不构成"Docker 容器是绝对安全边界"的证明**——没有做过内核级漏洞的对抗性测试，历史上 Docker/runc 本身也出现过真实的容器逃逸 CVE。`python_executor.py` 顶部的模块 docstring 已经把这句措辞写进去了，避免代码注释和这份文档的说法不一致。
 
 ### DataAnalyst 角色路由（Prompt 层面）
 - **状态**：已完成，已提交（commit `0c8c6c4`），已用真实测试验证
@@ -54,6 +128,7 @@
 - **附带发现（功能性小 bug，非安全问题）**：合法的只读 `WITH ... SELECT`（CTE 写法）会被现有前缀检查误判拒绝，因为语句以 "with" 开头，不是 "select"——记录为已知限制，暂不修
 
 ### python_executor 安全边界 —— 架构性天花板（2026-09-18 第二轮审查，Claude Code 实测确认）
+- **后续状态（2026-10-09）**：P0-1/P0-2/P0-3 均已通过容器化方案解决，见本文件最上方"python_executor 容器化"条目。本条目原文保留，作为问题发现过程的记录。
 - **P0-3 已修复（工具描述层面）**：原描述写"no file system or network access"，Claude Code 实测 `pd.read_pickle`/`pd.read_csv` 能直接读取本地文件（甚至读出了仓库自己的 pyproject.toml），这句承诺是假的。已改成诚实描述，明确告诉模型"pandas 本身有这个能力，但不应该用它访问 sql_executor 已提供数据之外的内容"——这是文字层面的弱引导，不是代码层面的强制拒绝，模型完全可能不遵守
 - **P0-1（已实测确认，未修复，判定为当前架构无法根治）**：pandas 模块是在沙箱外部用普通 `import pandas as pd` 加载的，它自己的模块全局命名空间里保留着真实、未受限的 `__builtins__`。实测 `pd.__builtins__['__import__']` 能绕过我们写的 `restricted_import` 包装，直接拿到真实的 `__import__`，进而访问任意系统模块
 - **P0-2（已实测确认，未修复，判定为当前架构无法根治）**：任何一个被放行的内置类型（`str`/`list`/`int`）都自带完整的对象继承体系，`().__class__.__bases__[0].__subclasses__()` 能枚举到进程里所有已加载的类（实测枚举到 858 个，包含 `subprocess.Popen`），完全不经过 `import` 语句，我们做的所有 `__import__` 白名单限制对这条路径无效。这是 Python 沙箱逃逸里最经典的手法之一

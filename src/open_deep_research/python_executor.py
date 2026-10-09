@@ -3,68 +3,439 @@
 设计理念：让模型自己写 pandas 代码去分析数据（比如算平均值、算增长率），
 而不是提前写死计算逻辑。
 
-安全边界（已知简化，非生产级）：
-- 用 exec() 执行，没有真正的进程/容器级隔离
-- 限制暴露给代码的命名空间，只给 pandas，不给 os/subprocess 等系统访问能力
-- 生产环境应换成真正的沙箱（Docker容器、E2B等），这是明确的已知待办
+安全边界（容器化版本，2026-10-09，加固版本，2026-10-09 第二轮）：
+- 真正的隔离边界现在是 Docker 容器本身，不再是 Python 应用层的
+  __builtins__/__import__ 白名单。旧方案已在 IMPROVEMENTS.md 里被
+  记录为可绕过（pd.__builtins__ 泄漏真实 __import__；
+  ().__class__.__bases__[0].__subclasses__() 枚举到 subprocess.Popen），
+  继续在 Python 层加规则属于治标不治本，因此本版本直接移除了该白名单。
+
+  重要措辞澄清：下面这些参数降低了特定风险的发生概率/影响范围，
+  不构成"绝对安全边界"的证明——没有做过内核级漏洞的对抗性测试，
+  Docker 本身的隔离也不是无懈可击的（历史上存在过容器逃逸 CVE）。
+
+- 每次调用都在一个一次性容器里执行，强制参数：
+    --network none                容器内无法访问任何网络（已实测：真实 OSError，不是应用层拦截）
+    --read-only + --tmpfs /tmp     根文件系统只读，仅 /tmp 可写，且显式限定大小（见下方 TMPFS_SIZE）
+    --memory / --memory-swap       必须设为同一值，缺一不可——
+                                    实测确认：只设 --memory 不设 --memory-swap，
+                                    Docker 默认允许 swap 到约 2 倍内存，
+                                    256m 限制下分配 1GB 照样会"成功"，两者都设才会被 OOM-kill
+    --cpus                         限制 CPU 占用
+    --pids-limit                   限制容器内进程/线程总数，防 fork bomb
+                                    （已实测：limit=64 时，fork 循环在第 63 个子进程后
+                                    收到 EOTHER/EAGAIN 风格的 OSError，被正确拦住）
+    --cap-drop=ALL                 丢弃所有 Linux capabilities（CAP_NET_RAW/CAP_SYS_ADMIN等）。
+                                    兼容性风险：如果将来镜像里的代码需要任何特殊能力
+                                    （比如 ping 需要 CAP_NET_RAW），会直接失败；
+                                    当前只跑纯 Python/pandas，没有这类需求，已实测基本执行不受影响
+    --security-opt=no-new-privileges  禁止通过 setuid/setgid 二进制提权。
+                                    兼容性风险：几乎为零，本镜像内没有任何 setuid 程序
+    --pull=never                   镜像必须已在本机构建好，禁止隐式联网拉取
+    不挂载任何宿主机目录             容器内看不到宿主机文件系统的任何内容（已实测验证）
+    保留 Docker 默认 seccomp profile  没有传 --security-opt seccomp=unconfined，
+                                    也没有自定义 profile——按要求维持默认
+
+- 代码通过 stdin 喂给容器内的 python3（镜像 ENTRYPOINT 为 `python3 -u -`），
+  不挂载卷、不写入命令行参数，避免注入和参数长度问题。提交的代码本身有
+  MAX_CODE_BYTES 字节上限，超出直接拒绝（不启动容器）。
+
+- stdout/stderr 采集：不再用 `subprocess.run(capture_output=True)`——那个
+  调用会把子进程的全部输出无上限地攒在内存里，一个打印几十MB的死循环就能
+  把宿主机内存吃满。现在用 Popen + 两个后台线程分别持续排空 stdout/stderr
+  管道，每次只 read() 一个 chunk，按字节数计数，超过限制后不再往缓冲区里
+  追加，但仍然继续读取并丢弃，直到 EOF —— 这是为了不让子进程因为管道写满
+  而被阻塞死锁，不是"读够了就不读了"。解码在全部读取结束后一次性做，用
+  errors="replace"，避免因为正好在截断点切开一个多字节 UTF-8 字符而抛异常。
+  已用 50MB 量级的压力测试验证：返回内容确实被限制住，不会把 50MB 都搬进
+  Python 这边的内存。
+
+  stdout 和 stderr 用了不同的截断策略（有意为之，不是疏漏）：
+    * stdout：只保留开头 MAX_OUTPUT_BYTES 字节（_BoundedStreamReader）。
+      已知取舍：如果真正想看的结果恰好在超长输出的末尾，会被截掉——
+      对 stdout 来说这个代价可以接受，模型应该用 print() 输出关键结果
+      而不是先打印大量无关内容
+    * stderr：保留开头 STDERR_HEAD_BYTES（2KB）+ 结尾 STDERR_TAIL_BYTES
+      （6KB），中间丢弃（_HeadTailStreamReader）。这是专门为了修复一个
+      实测验证过的真实问题：错误/异常信息几乎总是出现在 stderr 的末尾
+      （Python traceback 的最后一行才是真正的异常类型和消息），只保留
+      开头会恰好丢掉这条最有价值的信息；head+tail 两段式能同时保留
+      "最先出现的上下文" 和 "最后的真正报错"
+
+- 超时与清理（本轮重写）：
+    * `docker kill` 本身带超时（CLEANUP_KILL_TIMEOUT），不会无限等待一个
+      卡住的 Docker CLI
+    * kill 之后会用 `docker inspect` 轮询确认容器确实消失了
+      （有限轮询，CLEANUP_CONFIRM_TIMEOUT 内），而不是假设 kill 命令
+      返回成功就代表容器已经停止——这两者不是一回事，已用实测确认
+      （正常情况下 --rm 清理非常快，~100ms 级别），但轮询仍然是必要的
+      保险，不能把"Docker CLI 超时"直接当成"容器还在运行"
+    * 如果轮询超时仍未确认清理，会在返回的错误信息里如实说明
+      "无法确认容器已被清理"，不会声称清理成功
+
+- 已知局限（加固之后仍然存在，诚实记录，不是已解决）：
+    * 依赖本机已安装并运行 Docker，且镜像
+      my_extensions/docker/python_executor/Dockerfile 已提前 build 好
+      （tag: odr-python-executor:latest）——这是新增的硬性运行环境依赖，
+      没有宿主机执行回退（故意不做，避免"安全降级"）
+    * 每次调用都要起一个新容器，有额外的启动延迟（实测约 0.3-1 秒）
+    * 没有做真正的多租户资源隔离（多个并发调用之间只各自有自己的
+      --cpus/--memory 上限，没有额外的跨调用调度隔离）
+    * 没有做对抗性的内核漏洞测试，Docker 的隔离边界不是绝对的
+    * --cap-drop=ALL 和 --pids-limit 是本轮新加的，只验证了"不影响正常
+      pandas 执行"和"pids-limit 确实生效"，没有做更大规模的兼容性回归
 """
 
-import io
 import asyncio
-import contextlib
-import pandas as pd
+import subprocess
+import threading
+import time
+import uuid
+
 from langchain_core.tools import tool
 
+IMAGE_NAME = "odr-python-executor:latest"
+TIMEOUT_SECONDS = 15
+MEMORY_LIMIT = "256m"
+CPU_LIMIT = "0.5"
+PIDS_LIMIT = "64"
+TMPFS_SIZE = "64m"
+MAX_OUTPUT_BYTES = 20000  # stdout 的上限，字节为基础，只保留开头（见模块docstring已知取舍）
+STDERR_HEAD_BYTES = 2048  # stderr 保留的开头字节数（2KB）
+STDERR_TAIL_BYTES = 6144  # stderr 保留的结尾字节数（6KB）——结尾往往是真正的异常信息
+MAX_CODE_BYTES = 65536  # 提交代码本身的大小上限（64KB），超出直接拒绝
+READ_CHUNK_SIZE = 4096
+CLEANUP_KILL_TIMEOUT = 5  # `docker kill` 这条命令本身的超时
+CLEANUP_CONFIRM_TIMEOUT = 3  # 轮询确认容器已被移除的总时长上限
+CLEANUP_POLL_INTERVAL = 0.2
+READER_JOIN_TIMEOUT = 5  # 进程结束后，等待排空线程收尾的上限
+
 PYTHON_EXECUTOR_DESCRIPTION = (
-    "Execute Python (pandas) code for data analysis. "
-    "The variable pd (pandas) is available. "
+    "Execute Python (pandas) code for data analysis inside an isolated, "
+    "disposable Docker container (no network access, no access to the host "
+    "filesystem, limited memory/CPU/process-count, and a hard execution "
+    "timeout). This reduces -- but, as with any container-based sandbox, "
+    "does not absolutely guarantee -- isolation from the host. "
+    "The variable pd (pandas) is available; other standard-library modules "
+    "are technically importable but cannot reach the network or the host "
+    "machine, since isolation is enforced at the container level, not by "
+    "restricting which modules you may import. "
     "If you need data to analyze, first query it via sql_executor and "
     "construct a DataFrame from the result yourself. "
     "Use print() to output what you want to see -- only printed output "
-    "is returned to you. "
-    "Only pandas is available. Note: pandas itself can read local files or network URLs via functions like read_csv/read_pickle/read_json -- avoid using these to access anything outside the data you already have from sql_executor."
+    "is returned to you, and it is truncated beyond a size limit."
 )
+
+
+class _BoundedStreamReader:
+    """Continuously drains a subprocess pipe on a background thread,
+    keeping at most `limit_bytes` of what it reads.
+
+    Draining never stops once the limit is hit -- it keeps reading and
+    discarding the excess until EOF. This is deliberate: if we stopped
+    reading a pipe once "full", the child process could block forever
+    trying to write to it (classic subprocess deadlock), which would
+    leave the container running past any timeout we think we've enforced.
+    """
+
+    def __init__(self, stream, limit_bytes: int, chunk_size: int = READ_CHUNK_SIZE):
+        self._stream = stream
+        self._limit = limit_bytes
+        self._chunk_size = chunk_size
+        self._buf = bytearray()
+        self.truncated = False
+        self.total_bytes = 0
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(self._chunk_size)
+                if not chunk:
+                    break
+                self.total_bytes += len(chunk)
+                if len(self._buf) < self._limit:
+                    room = self._limit - len(self._buf)
+                    if len(chunk) <= room:
+                        self._buf.extend(chunk)
+                    else:
+                        self._buf.extend(chunk[:room])
+                        self.truncated = True
+                else:
+                    self.truncated = True
+        except (ValueError, OSError):
+            # 底层流被关掉了（比如进程被 kill）——安静退出，不是需要上报的错误
+            pass
+
+    def join(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def text(self) -> str:
+        # errors="replace"：截断点如果正好切在一个多字节 UTF-8 字符中间，
+        # 不能让 decode 直接抛异常——用替换字符顶上，而不是假装没截断过。
+        return self._buf.decode("utf-8", errors="replace")
+
+
+class _HeadTailStreamReader:
+    """跟 _BoundedStreamReader 一样持续排空管道防死锁，但保留两段：
+    开头 head_bytes 字节 + 结尾 tail_bytes 字节，中间丢弃（而不是只保留开头）。
+
+    用于 stderr：之前只保留开头的版本有一个真实验证过的缺陷——如果程序先写
+    大量内容到 stderr，真正有用的异常/traceback 往往出现在最后，只保留开头
+    会把这条真正有用的信息丢掉，保留的反而是前面没什么价值的内容。head+tail
+    两段式解决的正是这个问题。
+
+    head 区间和 tail 区间严格不重叠：tail 只从"超出 head 的部分"开始累积，
+    所以 head+tail 拼接后不会出现重复内容。
+    """
+
+    def __init__(self, stream, head_bytes: int, tail_bytes: int, chunk_size: int = READ_CHUNK_SIZE):
+        self._stream = stream
+        self._head_limit = head_bytes
+        self._tail_limit = tail_bytes
+        self._chunk_size = chunk_size
+        self._head_buf = bytearray()
+        self._tail_buf = bytearray()
+        self.total_bytes = 0
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(self._chunk_size)
+                if not chunk:
+                    break
+                self.total_bytes += len(chunk)
+                if len(self._head_buf) < self._head_limit:
+                    room = self._head_limit - len(self._head_buf)
+                    self._head_buf.extend(chunk[:room])
+                    chunk = chunk[room:]  # 剩下的部分（如果有）才算进 tail 的候选范围
+                if chunk:
+                    self._tail_buf.extend(chunk)
+                    if len(self._tail_buf) > self._tail_limit:
+                        # 只保留最后 tail_limit 字节的滑动窗口
+                        del self._tail_buf[: -self._tail_limit]
+        except (ValueError, OSError):
+            pass
+
+    def join(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    @property
+    def truncated(self) -> bool:
+        return self.total_bytes > (len(self._head_buf) + len(self._tail_buf))
+
+    def text(self) -> str:
+        head_text = self._head_buf.decode("utf-8", errors="replace")
+        tail_text = self._tail_buf.decode("utf-8", errors="replace")
+        return head_text + tail_text
+
+
+def _write_stdin_and_close(proc: subprocess.Popen, data: bytes) -> None:
+    try:
+        proc.stdin.write(data)
+    except (BrokenPipeError, OSError):
+        # 子进程可能已经因为代码里的早期错误退出，stdin 写入失败不是本函数要处理的错误
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+
+def _kill_and_confirm_removed(container_name: str) -> bool:
+    """Best-effort kill of a named container, with a bounded poll to
+    confirm it is actually gone afterward.
+
+    Returns True only if removal was directly observed via `docker
+    inspect` returning "no such object". Returns False if we cannot
+    confirm this within the grace period -- this is NOT the same as
+    confirming the kill failed; it only means we refuse to claim
+    something we didn't observe. A `docker kill` exit code of 0 only
+    means the kill signal was accepted, not that the container has
+    actually stopped and been removed yet.
+    """
+    try:
+        subprocess.run(
+            ["docker", "kill", container_name],
+            capture_output=True,
+            text=True,
+            timeout=CLEANUP_KILL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        # `docker kill` 本身卡住了，不代表容器没被杀掉——继续往下轮询确认，
+        # 用真实观察结果判断，而不是靠这条命令的返回值推断
+        pass
+    except FileNotFoundError:
+        return False
+
+    deadline = time.monotonic() + CLEANUP_CONFIRM_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", container_name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        if result.returncode != 0:
+            # "no such object" -- --rm 已经把它连容器对象一起移除了
+            return True
+        time.sleep(CLEANUP_POLL_INTERVAL)
+    return False
+
+
+def _run_in_container(code: str) -> str:
+    """Run `code` to completion inside a fresh, isolated container and
+    return captured stdout (or a descriptive error string).
+
+    Blocking by design -- callers must offload this to a thread.
+    """
+    code_bytes = code.encode("utf-8")
+    if len(code_bytes) > MAX_CODE_BYTES:
+        return (
+            f"Python Error: submitted code is {len(code_bytes)} bytes, "
+            f"which exceeds the {MAX_CODE_BYTES}-byte limit. Shorten the "
+            "code (this check runs before any container is started)."
+        )
+
+    container_name = f"odr-python-executor-{uuid.uuid4().hex[:12]}"
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "--name", container_name,
+        "--network", "none",
+        "--read-only",
+        "--tmpfs", f"/tmp:size={TMPFS_SIZE},mode=1777",
+        f"--memory={MEMORY_LIMIT}",
+        f"--memory-swap={MEMORY_LIMIT}",
+        f"--cpus={CPU_LIMIT}",
+        f"--pids-limit={PIDS_LIMIT}",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--pull=never",
+        IMAGE_NAME,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return (
+            "Python Error: the `docker` command was not found. "
+            "Containerized execution requires Docker to be installed and "
+            "on PATH -- this tool has no non-containerized fallback."
+        )
+    except OSError as e:
+        return f"Python Error: failed to start the sandbox container: {e}"
+
+    stdout_reader = _BoundedStreamReader(proc.stdout, MAX_OUTPUT_BYTES)
+    stderr_reader = _HeadTailStreamReader(proc.stderr, STDERR_HEAD_BYTES, STDERR_TAIL_BYTES)
+    stdout_reader.start()
+    stderr_reader.start()
+    stdin_thread = threading.Thread(
+        target=_write_stdin_and_close, args=(proc, code_bytes), daemon=True
+    )
+    stdin_thread.start()
+
+    try:
+        proc.wait(timeout=TIMEOUT_SECONDS)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+    if timed_out:
+        cleanup_confirmed = _kill_and_confirm_removed(container_name)
+        # 容器死了之后，docker run 客户端进程自己也该随之退出；给它一点时间，
+        # 真退不掉再兜底 kill 一下这个本地客户端进程（不是容器）。
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        stdin_thread.join(timeout=2)
+        stdout_reader.join(timeout=READER_JOIN_TIMEOUT)
+        stderr_reader.join(timeout=READER_JOIN_TIMEOUT)
+        if cleanup_confirmed:
+            return (
+                f"Python Error: execution exceeded the {TIMEOUT_SECONDS}s "
+                "timeout; the sandbox container was killed and its removal "
+                "was confirmed via `docker inspect`. No output is "
+                "available for code that did not finish."
+            )
+        return (
+            f"Python Error: execution exceeded the {TIMEOUT_SECONDS}s "
+            "timeout; a kill was issued but the container's removal could "
+            "NOT be confirmed within the cleanup grace period -- it may "
+            "still be stopping. No output is available."
+        )
+
+    stdin_thread.join(timeout=2)
+    stdout_reader.join(timeout=READER_JOIN_TIMEOUT)
+    stderr_reader.join(timeout=READER_JOIN_TIMEOUT)
+
+    stdout_text = stdout_reader.text()
+    stderr_text = stderr_reader.text()
+
+    if proc.returncode != 0:
+        if proc.returncode == 137:
+            # 137 (SIGKILL) 跟超出内存限制一致，但不是内存限制独有的信号——
+            # 外部直接 kill -9 这个进程也会得到同样的退出码，不能断言唯一原因
+            hint = (
+                " (exit 137: consistent with being OOM-killed for exceeding "
+                f"the {MEMORY_LIMIT} memory limit, but exit 137 can also "
+                "result from an external SIGKILL, so this is not proof of "
+                "the specific cause)"
+            )
+        else:
+            hint = ""
+        detail = stderr_text.strip() or f"process exited with code {proc.returncode}"
+        if stderr_reader.truncated:
+            detail += (
+                f"\n... [stderr truncated: kept first {STDERR_HEAD_BYTES} + "
+                f"last {STDERR_TAIL_BYTES} bytes, omitted the middle, "
+                f"{stderr_reader.total_bytes} bytes written in total]"
+            )
+        return f"Python Error: {detail}{hint}"
+
+    if not stdout_text.strip():
+        return "Code executed successfully but produced no printed output. Use print() to see results."
+
+    if stdout_reader.truncated:
+        stdout_text += (
+            f"\n... [stdout truncated at {MAX_OUTPUT_BYTES} bytes, "
+            f"{stdout_reader.total_bytes} bytes written in total]"
+        )
+    return stdout_text
 
 
 @tool(description=PYTHON_EXECUTOR_DESCRIPTION)
 async def python_executor(code: str) -> str:
-    """Execute Python/pandas code and return captured print output.
+    """Execute Python/pandas code inside an isolated Docker container and
+    return captured stdout.
 
     Args:
         code: Python code using pandas (as pd). Must use print() to
               produce visible output.
 
     Returns:
-        Captured stdout, or the raw error message if execution failed.
+        Captured stdout, or a descriptive error message if execution
+        failed, timed out, or the sandbox itself could not run.
     """
-    # 加固：允许 import，但限制只能导入白名单里的模块（比如 pandas），
-    # 拦住 __import__("os") 这类试图访问系统模块的调用。
-    # 仍不构成可靠沙箱——只是比之前收紧一点，这是应用层限制，不是真正隔离。
-    ALLOWED_MODULES = {"pandas", "math", "statistics"}
-
-    def restricted_import(name, *args, **kwargs):
-        if name not in ALLOWED_MODULES:
-            raise ImportError(f"Importing '{name}' is not allowed. Only {ALLOWED_MODULES} are permitted.")
-        return __import__(name, *args, **kwargs)
-
-    safe_builtins = {
-        "print": print, "len": len, "range": range, "str": str, "int": int,
-        "float": float, "list": list, "dict": dict, "__import__": restricted_import,
-    }
-    safe_globals = {"pd": pd, "__builtins__": safe_builtins}
-
-    def _run_code():
-        output_buffer = io.StringIO()
-        with contextlib.redirect_stdout(output_buffer):
-            exec(code, safe_globals)
-        result = output_buffer.getvalue()
-        if not result.strip():
-            return "Code executed successfully but produced no printed output. Use print() to see results."
-        return result
-
     try:
-        # 同样的原因：exec() 是同步阻塞调用，丢到独立线程跑，
-        # 避免占用主事件循环
-        return await asyncio.to_thread(_run_code)
+        return await asyncio.to_thread(_run_in_container, code)
     except Exception as e:
         return f"Python Error: {type(e).__name__}: {str(e)}"
