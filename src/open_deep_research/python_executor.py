@@ -94,7 +94,7 @@ import uuid
 
 from langchain_core.tools import tool
 
-from open_deep_research.tool_reliability import TransientToolError
+from open_deep_research.tool_reliability import TransientToolError, NonRetryableInfrastructureError
 
 IMAGE_NAME = "odr-python-executor:latest"
 TIMEOUT_SECONDS = 15
@@ -252,6 +252,30 @@ def _write_stdin_and_close(proc: subprocess.Popen, data: bytes) -> None:
             proc.stdin.close()
         except OSError:
             pass
+
+
+def _probe_docker_daemon_reachable() -> bool:
+    """`docker run` 以非零码退出（且不是镜像缺失那个125）之后，用这个探测
+    判断原因是"daemon 这会儿连不上"还是"容器里的代码自己报错"——判定只看
+    这条探测命令自己的退出码（0=成功），不解析任何输出文本，不是在猜字符串。
+
+    只在失败路径上调用（不给每次成功执行都加一次额外开销），超时3秒。
+
+    已知局限（诚实记录，不是已解决）：`docker run` 失败和这次探测之间存在
+    时间窗口，如果 daemon 恰好在这个窗口里从不可达恢复到可达，会把本来是
+    daemon 问题导致的失败误判成 tool_input_error——这是刻意选择的保守方向
+    （宁可少重试，不要把用户代码的真实报错错误地当成基础设施问题去重试），
+    不是忽略了这个竞态条件。
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True,
+            timeout=3,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
 
 
 def _kill_and_confirm_removed(container_name: str) -> bool:
@@ -416,17 +440,34 @@ def _run_in_container(code: str) -> str:
     stderr_text = stderr_reader.text()
 
     if proc.returncode != 0:
-        # 已知局限（2026-10 熔断分类review时确认，不是本轮改动的新行为）：
-        # 这个分支覆盖两类完全不同的情况——"容器里的代码自己跑错/异常退出"
-        # （真的是 tool_input_error）和"docker run 这个进程本身没能正常工作"
-        # （比如镜像缺失、daemon 拒绝连接——这些其实是 infrastructure_error）。
-        # 两者都表现为"进程能启动、但以非零码退出"，要可靠区分需要解析
-        # stderr 文本内容（比如找"Cannot connect to the Docker daemon"这类
-        # 字符串），这正是要刻意避免的"靠字符串前缀分类"，所以这里统一按
-        # tool_input_error 处理（不抛异常，直接返回字符串）——多数真实场景下
-        # 这确实是代码错误，但"daemon 拒绝连接"这种情况目前不会计入熔断。
-        # 如果以后需要更精确区分，可以考虑调用前做一次独立的 `docker info`
-        # 连通性探测（不解析这里的 stderr），但这超出当前范围，没有擅自做。
+        # 2026-10 修复：之前这个分支统一按 tool_input_error 处理，因为无法
+        # 在不解析 stderr 的前提下区分"容器里的代码自己报错"和"docker run
+        # 这个进程本身没能正常工作"（镜像缺失/daemon连不上）。实测（Docker
+        # 29.2.1）确认：镜像缺失稳定返回退出码125；但"daemon不可达"和
+        # "容器内未捕获异常"**退出码完全相同，都是1**——并不遵循"125=docker
+        # 自身错误"这条常被引用的约定，纯退出码在这两者之间天然不可区分。
+        # 解法：125 直接按 infrastructure_error 处理（--pull=never 下镜像
+        # 缺失不会因为重试而恢复，所以不重试）；其余非零退出码，失败之后
+        # 再探测一次 `docker version` 自己的退出码（不解析任何文本）判断
+        # daemon 当下是否可达，由此决定分类。
+        if proc.returncode == 125:
+            raise NonRetryableInfrastructureError(
+                f"Python Error: docker run exited with code 125 (Docker's own "
+                "error, typically a missing/invalid image). This image is "
+                f"never auto-pulled (--pull=never), so retrying will not "
+                f"recover from a missing image: {stderr_text.strip()}"
+            )
+        if proc.returncode != 137 and not _probe_docker_daemon_reachable():
+            # 探测失败/超时：daemon 当下连不上，原来的非零退出大概率是这个
+            # 原因——分类为可重试的瞬时错误。137(OOM) 不做这个探测，
+            # 因为那是我们自己的 --memory 限制杀的容器，和 daemon 是否可达
+            # 无关，探测只会白白增加延迟。
+            raise TransientToolError(
+                f"Python Error: execution failed with exit code "
+                f"{proc.returncode}, and a post-failure probe confirmed the "
+                "Docker daemon is not reachable right now -- treating this "
+                f"as a transient infrastructure issue: {stderr_text.strip()}"
+            )
         if proc.returncode == 137:
             # 137 (SIGKILL) 跟超出内存限制一致，但不是内存限制独有的信号——
             # 外部直接 kill -9 这个进程也会得到同样的退出码，不能断言唯一原因
@@ -473,11 +514,12 @@ async def python_executor(code: str) -> str:
     """
     try:
         return await asyncio.to_thread(_run_in_container, code)
-    except TransientToolError as e:
-        # _run_in_container 为了让 execute_tool_safely 能做重试判断，对"容器/进程
-        # 没能启动"这类失败抛的是类型化异常而不是直接 return 字符串；这里原样转换
-        # 回字符串（str(e) 就是构造异常时传入的那条消息，不做任何改写），直接
-        # 调用 python_executor.ainvoke(...)（现有 18 个测试的调用方式）时行为和
+    except (TransientToolError, NonRetryableInfrastructureError) as e:
+        # _run_in_container 为了让 execute_tool_safely 能做重试判断，对
+        # "容器/进程没能启动"、"镜像缺失"、"探测确认daemon不可达"这些失败抛的
+        # 是类型化异常而不是直接 return 字符串；这里原样转换回字符串（str(e)
+        # 就是构造异常时传入的那条消息，不做任何改写），直接调用
+        # python_executor.ainvoke(...)（现有 18 个测试的调用方式）时行为和
         # 加这层重试判断之前完全一致。
         return str(e)
     except Exception as e:

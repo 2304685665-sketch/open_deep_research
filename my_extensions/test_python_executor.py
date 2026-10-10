@@ -404,6 +404,96 @@ with open("/proc/self/status") as f:
     print(f"test_cap_drop_all_results_in_zero_effective_capabilities 通过（CapEff={cap_value}，确认没有任何capability）")
 
 
+# ---------------------------------------------------------------------------
+# 2026-10 新增：非零退出码分类（125 / 探测daemon可达性）
+# 前3个用 mock，只隔离测试 _probe_docker_daemon_reachable 本身；
+# 后2个用真实 Docker，走完整的 _run_in_container/python_executor_tool_call。
+# ---------------------------------------------------------------------------
+
+def test_probe_returns_true_when_docker_version_succeeds():
+    from unittest.mock import patch, MagicMock
+    fake_result = MagicMock(returncode=0)
+    with patch("python_executor.subprocess.run", return_value=fake_result) as mock_run:
+        assert pe._probe_docker_daemon_reachable() is True
+    assert mock_run.called
+    print("test_probe_returns_true_when_docker_version_succeeds 通过")
+
+
+def test_probe_returns_false_when_docker_version_fails():
+    from unittest.mock import patch, MagicMock
+    fake_result = MagicMock(returncode=1)
+    with patch("python_executor.subprocess.run", return_value=fake_result):
+        assert pe._probe_docker_daemon_reachable() is False
+    print("test_probe_returns_false_when_docker_version_fails 通过")
+
+
+def test_probe_returns_false_on_timeout():
+    from unittest.mock import patch
+    with patch("python_executor.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="docker version", timeout=3)):
+        assert pe._probe_docker_daemon_reachable() is False
+    print("test_probe_returns_false_on_timeout 通过")
+
+
+@pytest.mark.asyncio
+async def test_missing_image_classified_as_nonretryable_infrastructure_error():
+    """退出码125（镜像缺失）应该被分类为 NonRetryableInfrastructureError，
+    不是 TransientToolError——--pull=never 下重试不会让缺失的镜像出现。
+    走的是 python_executor_tool_call（execute_tool_safely 实际调用的
+    "抛异常版"入口），不是公开工具函数，这样才能直接看到异常类型。"""
+    from python_executor import python_executor_tool_call
+    original_image = pe.IMAGE_NAME
+    pe.IMAGE_NAME = "odr-python-executor-this-tag-does-not-exist:latest"
+    try:
+        try:
+            await python_executor_tool_call("print(1)")
+            raised = None
+        except Exception as e:
+            raised = e
+        assert isinstance(raised, pe.NonRetryableInfrastructureError), (
+            f"预期 NonRetryableInfrastructureError，实际是 "
+            f"{type(raised).__name__ if raised else None}"
+        )
+        assert "125" in str(raised)
+        print(f"test_missing_image_classified_as_nonretryable_infrastructure_error 通过"
+              f"（{type(raised).__name__}: {str(raised)[:80]}...）")
+    finally:
+        pe.IMAGE_NAME = original_image
+
+
+@pytest.mark.asyncio
+async def test_docker_daemon_unreachable_classified_as_transient_retryable():
+    """daemon不可达（exit code 1，和代码报错相同）应该经探测确认后分类为
+    TransientToolError，不是 tool_input_error。用真实 DOCKER_HOST 指向不存在
+    端口触发（和已有的 test_docker_daemon_unreachable_gives_clear_error 用
+    同样的真实触发方式），这里额外验证的是"抛异常版"入口能看到正确的异常
+    类型，而不只是公开工具函数转换回的字符串里有没有 'Python Error'。"""
+    import os
+    from python_executor import python_executor_tool_call
+
+    original_docker_host = os.environ.get("DOCKER_HOST")
+    os.environ["DOCKER_HOST"] = "tcp://127.0.0.1:1"
+    try:
+        start = time.time()
+        try:
+            await python_executor_tool_call("print(1)")
+            raised = None
+        except Exception as e:
+            raised = e
+        elapsed = time.time() - start
+        assert isinstance(raised, pe.TransientToolError), (
+            f"预期 TransientToolError，实际是 "
+            f"{type(raised).__name__ if raised else None}: {raised}"
+        )
+        assert elapsed < 10, f"应该很快失败（含一次3秒探测），实际耗时 {elapsed:.1f}s"
+        print(f"test_docker_daemon_unreachable_classified_as_transient_retryable 通过"
+              f"（{elapsed:.2f}s内确认daemon不可达，正确分类为TransientToolError）")
+    finally:
+        if original_docker_host is None:
+            os.environ.pop("DOCKER_HOST", None)
+        else:
+            os.environ["DOCKER_HOST"] = original_docker_host
+
+
 async def main():
     await test_basic_calculation()
     await test_no_print_gives_hint()
@@ -423,9 +513,14 @@ async def main():
     await test_timeout_cleanup_actually_removes_container()
     await test_concurrent_calls_do_not_cross_contaminate()
     await test_cap_drop_all_results_in_zero_effective_capabilities()
+    test_probe_returns_true_when_docker_version_succeeds()
+    test_probe_returns_false_when_docker_version_fails()
+    test_probe_returns_false_on_timeout()
+    await test_missing_image_classified_as_nonretryable_infrastructure_error()
+    await test_docker_daemon_unreachable_classified_as_transient_retryable()
     print(
         "\n全部测试通过。网络隔离、宿主机文件系统隔离、内存限制、进程数限制、"
-        "执行超时及其清理确认、有界输出采集均已用真实容器行为验证。"
+        "执行超时及其清理确认、有界输出采集、非零退出码分类均已用真实容器行为验证。"
     )
 
 
