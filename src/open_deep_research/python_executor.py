@@ -94,6 +94,8 @@ import uuid
 
 from langchain_core.tools import tool
 
+from open_deep_research.tool_reliability import TransientToolError
+
 IMAGE_NAME = "odr-python-executor:latest"
 TIMEOUT_SECONDS = 15
 MEMORY_LIMIT = "256m"
@@ -335,13 +337,21 @@ def _run_in_container(code: str) -> str:
             stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
-        return (
+        # 2026-10 加入重试分类：这两个分支是"容器/进程根本没能起来"，跟下面
+        # proc.wait() 之后"容器起来了但镜像缺失/daemon 拒绝连接"（走 returncode!=0
+        # 分支）是不同的失败面——后者目前不分类为瞬时性，因为要可靠区分"这次
+        # daemon 连不上"和"别的原因导致非零退出码"需要解析 stderr 文本内容，这正是
+        # 要刻意避免的"靠字符串前缀分类"。这里改成抛 TransientToolError 而不是直接
+        # return 字符串，只影响 execute_tool_safely 的重试判断路径；下面的公开
+        # python_executor 函数会把它转换回和以前完全一样的字符串，直接调用
+        # python_executor.ainvoke(...)（现有 18 个测试的调用方式）的行为不受影响。
+        raise TransientToolError(
             "Python Error: the `docker` command was not found. "
             "Containerized execution requires Docker to be installed and "
             "on PATH -- this tool has no non-containerized fallback."
         )
     except OSError as e:
-        return f"Python Error: failed to start the sandbox container: {e}"
+        raise TransientToolError(f"Python Error: failed to start the sandbox container: {e}")
 
     stdout_reader = _BoundedStreamReader(proc.stdout, MAX_OUTPUT_BYTES)
     stderr_reader = _HeadTailStreamReader(proc.stderr, STDERR_HEAD_BYTES, STDERR_TAIL_BYTES)
@@ -370,13 +380,28 @@ def _run_in_container(code: str) -> str:
         stdout_reader.join(timeout=READER_JOIN_TIMEOUT)
         stderr_reader.join(timeout=READER_JOIN_TIMEOUT)
         if cleanup_confirmed:
+            # 这是"用户代码本身跑太久"的正常超时——干净地确认了容器已清理，
+            # 问题出在提交的代码上，不是环境本身出了问题。2026-10 加入
+            # failure_kind 分类后：这个分支保持 return 字符串（不抛异常），
+            # execute_tool_safely 据此把它归为 tool_input_error，不计入熔断
+            # ——模型写的代码跑超时很正常，不该因此被熔断掉整个工具。
             return (
                 f"Python Error: execution exceeded the {TIMEOUT_SECONDS}s "
                 "timeout; the sandbox container was killed and its removal "
                 "was confirmed via `docker inspect`. No output is "
                 "available for code that did not finish."
             )
-        return (
+        # 这不是"代码跑太久"的问题——是清理机制本身没能在宽限期内确认清理
+        # 结果，这是环境/基础设施层面的不确定状态，不是提交的代码的错。
+        # 2026-10 改成抛 TransientToolError（而不是直接 return 字符串），
+        # 这样 execute_tool_safely 才能把它归为 infrastructure_error（计入
+        # 熔断）而不是 tool_input_error，并且因为是 TransientToolError，
+        # 还会被纳入有限次数的重试——每次重试会用一个新的 uuid 命名的容器，
+        # 不会和"可能还没真正停止"的旧容器冲突。公开的 python_executor 函数
+        # 会把这个异常转换回和以前完全一致的字符串（见下方），
+        # test_cleanup_not_confirmed_is_reported_honestly 这个已有测试
+        # 断言的是这段消息文本，不是"是否抛异常"，所以不受影响。
+        raise TransientToolError(
             f"Python Error: execution exceeded the {TIMEOUT_SECONDS}s "
             "timeout; a kill was issued but the container's removal could "
             "NOT be confirmed within the cleanup grace period -- it may "
@@ -391,6 +416,17 @@ def _run_in_container(code: str) -> str:
     stderr_text = stderr_reader.text()
 
     if proc.returncode != 0:
+        # 已知局限（2026-10 熔断分类review时确认，不是本轮改动的新行为）：
+        # 这个分支覆盖两类完全不同的情况——"容器里的代码自己跑错/异常退出"
+        # （真的是 tool_input_error）和"docker run 这个进程本身没能正常工作"
+        # （比如镜像缺失、daemon 拒绝连接——这些其实是 infrastructure_error）。
+        # 两者都表现为"进程能启动、但以非零码退出"，要可靠区分需要解析
+        # stderr 文本内容（比如找"Cannot connect to the Docker daemon"这类
+        # 字符串），这正是要刻意避免的"靠字符串前缀分类"，所以这里统一按
+        # tool_input_error 处理（不抛异常，直接返回字符串）——多数真实场景下
+        # 这确实是代码错误，但"daemon 拒绝连接"这种情况目前不会计入熔断。
+        # 如果以后需要更精确区分，可以考虑调用前做一次独立的 `docker info`
+        # 连通性探测（不解析这里的 stderr），但这超出当前范围，没有擅自做。
         if proc.returncode == 137:
             # 137 (SIGKILL) 跟超出内存限制一致，但不是内存限制独有的信号——
             # 外部直接 kill -9 这个进程也会得到同样的退出码，不能断言唯一原因
@@ -437,5 +473,23 @@ async def python_executor(code: str) -> str:
     """
     try:
         return await asyncio.to_thread(_run_in_container, code)
+    except TransientToolError as e:
+        # _run_in_container 为了让 execute_tool_safely 能做重试判断，对"容器/进程
+        # 没能启动"这类失败抛的是类型化异常而不是直接 return 字符串；这里原样转换
+        # 回字符串（str(e) 就是构造异常时传入的那条消息，不做任何改写），直接
+        # 调用 python_executor.ainvoke(...)（现有 18 个测试的调用方式）时行为和
+        # 加这层重试判断之前完全一致。
+        return str(e)
     except Exception as e:
         return f"Python Error: {type(e).__name__}: {str(e)}"
+
+
+async def python_executor_tool_call(code: str) -> str:
+    """execute_tool_safely 实际调用的入口，而不是上面的公开 python_executor 工具。
+
+    行为和公开工具完全一致，唯一区别是不吞掉 TransientToolError——
+    execute_tool_safely 需要看到真实的异常类型才能判断是否值得重试。
+    LangChain 通过 `.ainvoke()` 直接调用公开工具时（包括现有测试）走的是
+    上面那条会把 TransientToolError 转换回字符串的路径，不受这个函数影响。
+    """
+    return await asyncio.to_thread(_run_in_container, code)

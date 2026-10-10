@@ -51,6 +51,71 @@ class Configuration(BaseModel):
             }
         }
     )
+    tool_retry_max_attempts: int = Field(
+        default=2,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 2,
+                "min": 0,
+                "max": 5,
+                "description": (
+                    "工具执行被分类为瞬时性失败（TransientToolError 或已知网络异常类型）时，"
+                    "最多重试几次（不含首次尝试）。这个重试只覆盖工具执行本身，和上面的 "
+                    "max_structured_output_retries（模型生成/工具调用决策阶段的重试）是两件事，"
+                    "不要混用。"
+                )
+            }
+        }
+    )
+    tool_retry_base_delay_seconds: float = Field(
+        default=0.5,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 0.5,
+                "min": 0.1,
+                "max": 5.0,
+                "description": "工具重试的指数退避基础延迟（秒）：第 N 次重试等待 base * 2^(N-1)"
+            }
+        }
+    )
+    tool_call_timeout_seconds: float = Field(
+        default=30.0,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 30.0,
+                "min": 5.0,
+                "max": 120.0,
+                "description": (
+                    "单次工具调用的外层统一超时（秒），覆盖的是 execute_tool_safely 整个调用"
+                    "（包括它内部的重试循环和每次重试之间的退避等待），不是单次尝试的超时。"
+                    "作为没有自带超时保护的工具的安全网。必须大于所有已知工具各自的内部超时+"
+                    "清理耗时上限（python_executor 最坏情况约 15s 执行 + 8s 清理 ≈ 23s；"
+                    "sql_executor 5s；internal_doc_search 15s），否则外层超时会在工具自己的"
+                    "清理逻辑完成前就截断等待，参见 "
+                    "test_outer_timeout_larger_than_inner_does_not_leak_container 的验证。"
+                )
+            }
+        }
+    )
+    tool_circuit_breaker_threshold: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 1,
+                "max": 10,
+                "description": (
+                    "单个工具在同一次 researcher 子图运行内连续失败达到这个次数后，"
+                    "本次运行内后续对该工具的调用直接返回'暂时不可用'，不再真正执行。"
+                    "状态存在 ResearcherState.tool_failure_counts 里，随子图调用天然按运行隔离。"
+                )
+            }
+        }
+    )
     allow_clarification: bool = Field(
         default=True,
         metadata={

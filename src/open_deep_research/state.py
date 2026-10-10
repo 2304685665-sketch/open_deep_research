@@ -88,6 +88,12 @@ class ResearcherState(TypedDict):
     research_topic: str
     compressed_research: str
     raw_notes: Annotated[list[str], override_reducer] = []
+    # 每个工具连续失败次数的快照，key 是工具名。没有用 Annotated 包 reducer——
+    # 和 tool_call_iterations 一样采用 LangGraph 对普通字段的默认行为（整体替换），
+    # 因为 researcher_tools 每次都会算出"更新后的完整计数字典"再整体写回，不需要
+    # 任何合并语义。这个字段只存在于单次 researcher 子图调用的 state 里，天然随每次
+    # researcher_subgraph.ainvoke(...) 调用重新开始，不会被不同的研究任务/并发运行共享。
+    tool_failure_counts: dict[str, int] = {}
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""
