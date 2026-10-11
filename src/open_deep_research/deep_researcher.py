@@ -20,6 +20,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from open_deep_research import run_trace
 from open_deep_research.citation_verification import verify_citations
 from open_deep_research.memory_manager import save_memory, search_memory, DEMO_USER_ID
 from open_deep_research.configuration import (
@@ -323,6 +324,22 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
             overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
             
+            # 2026-10 B3：只有启用了run_trace时才构造config副本——每个并行
+            # researcher各自拿一份独立的researcher_id，解决多个并行researcher
+            # 共享同一个config对象、trace事件分不清"谁是谁"的问题（已在Step 0
+            # 用代码证据确认过：原来的config是同一个对象，塞进去的任何标识都会
+            # 被所有并行调用共享）。未启用时原样传同一个config对象，不构造
+            # 任何副本，默认行为（包括对象identity）完全不变。
+            if run_trace.is_enabled(config):
+                def _per_researcher_config(cfg):
+                    return {**cfg, "configurable": {
+                        **cfg.get("configurable", {}),
+                        "run_trace_researcher_id": run_trace.new_id(),
+                    }}
+                research_configs = [_per_researcher_config(config) for _ in allowed_conduct_research_calls]
+            else:
+                research_configs = [config for _ in allowed_conduct_research_calls]
+
             # Execute research tasks in parallel
             research_tasks = [
                 researcher_subgraph.ainvoke({
@@ -330,8 +347,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
                         HumanMessage(content=tool_call["args"]["research_topic"])
                     ],
                     "research_topic": tool_call["args"]["research_topic"]
-                }, config) 
-                for tool_call in allowed_conduct_research_calls
+                }, per_call_config)
+                for tool_call, per_call_config in zip(allowed_conduct_research_calls, research_configs)
             ]
             
             tool_results = await asyncio.gather(*research_tasks)
@@ -526,9 +543,13 @@ def _log_tool_attempt(
 
 
 async def execute_tool_safely(
-    tool, args, config, configurable: "Configuration | None" = None
+    tool, args, config, configurable: "Configuration | None" = None, research_topic: str = ""
 ) -> tuple[str, str, str, int]:
     """执行单个工具调用，对分类为瞬时性的失败做有限次数的指数退避重试。
+
+    2026-10 B3：新增可选参数research_topic（有默认值，不影响任何现有调用
+    方），只用于run_trace.emit()的事件标注，不参与任何判断逻辑。**返回值
+    签名未变**，仍是 (content, status, failure_kind, attempts) 四元组。
 
     返回 (content, status, failure_kind, attempts) 四元组（2026-10 T3 新增
     attempts——记的是这次调用总共尝试了几次，给 researcher_tools 记录
@@ -574,21 +595,35 @@ async def execute_tool_safely(
 
     if raising_call is None:
         t0 = time.monotonic()
+        run_trace.emit("tool_start", config=config, research_topic=research_topic,
+                        tool=tool_name, attempt=1, params=args)
         try:
             result = await tool.ainvoke(args, config)
         except Exception as e:
+            duration_ms = (time.monotonic() - t0) * 1000
             _log_tool_attempt(tool_name, attempt=1, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=1, duration_ms=duration_ms,
+                            status="error", failure_kind="infrastructure_error",
+                            output=str(e))
             return f"Error executing tool: {str(e)}", "error", "infrastructure_error", 1
         content, status, failure_kind = _classify_clean_return(result)
+        duration_ms = (time.monotonic() - t0) * 1000
         _log_tool_attempt(tool_name, attempt=1, failure_kind=failure_kind,
                            duration_s=time.monotonic() - t0, will_retry=False)
+        run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                        tool=tool_name, attempt=1, duration_ms=duration_ms,
+                        status=status, failure_kind=failure_kind,
+                        output=content if isinstance(content, str) else None)
         return content, status, failure_kind, 1
 
     attempt = 0
     while True:
         attempt += 1
         t0 = time.monotonic()
+        run_trace.emit("tool_start", config=config, research_topic=research_topic,
+                        tool=tool_name, attempt=attempt, params=args)
         try:
             result = await raising_call(**args)
         except NonRetryableInfrastructureError as e:
@@ -596,27 +631,46 @@ async def execute_tool_safely(
             # NonRetryableInfrastructureError 的文档字符串（目前唯一场景是
             # internal_doc_search 超时：被放弃的后台线程仍在运行，重试会让
             # 这类线程堆积）。
+            duration_ms = (time.monotonic() - t0) * 1000
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=attempt, duration_ms=duration_ms,
+                            status="error", failure_kind="infrastructure_error", output=str(e))
             return str(e), "error", "infrastructure_error", attempt
         except (TransientToolError,) + TRANSIENT_NETWORK_EXCEPTION_TYPES as e:
             will_retry = attempt <= max_retries
+            duration_ms = (time.monotonic() - t0) * 1000
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=will_retry)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=attempt, duration_ms=duration_ms,
+                            status="error", failure_kind="infrastructure_error", output=str(e))
             if not will_retry:
                 return str(e), "error", "infrastructure_error", attempt
+            run_trace.emit("retry", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=attempt, reason="transient_error")
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
         except Exception as e:
             # 未被分类成瞬时性错误的其他异常——不重试，直接返回，算
             # infrastructure_error（这是一个我们没预料到的失败形态，不是
             # 工具按自己的逻辑产出的、可以理解的"输入有问题"）。
+            duration_ms = (time.monotonic() - t0) * 1000
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=attempt, duration_ms=duration_ms,
+                            status="error", failure_kind="infrastructure_error", output=str(e))
             return f"Error executing tool: {str(e)}", "error", "infrastructure_error", attempt
         else:
             content, status, failure_kind = _classify_clean_return(result)
+            duration_ms = (time.monotonic() - t0) * 1000
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind=failure_kind,
                                duration_s=time.monotonic() - t0, will_retry=False)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=attempt, duration_ms=duration_ms,
+                            status=status, failure_kind=failure_kind,
+                            output=content if isinstance(content, str) else None)
             return content, status, failure_kind, attempt
 
 
@@ -724,6 +778,21 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         """
         name = tool_call["name"]
 
+        # 2026-10 审查后新增：call_id复用tool_call自带的id（模型产生这次
+        # 工具调用时自己生成的，ToolMessage.tool_call_id用的就是它），不是
+        # 另外发明一个。只在启用追踪时构造一份config副本把它塞进去——和
+        # supervisor_tools那处构造researcher_id副本的做法完全一致（关闭时
+        # 原样传config，不构造任何副本，默认行为不变）。这样execute_tool_
+        # safely内部的emit调用不需要新增任何参数就能拿到call_id，不用改
+        # 它的函数签名。
+        if run_trace.is_enabled(config):
+            trace_config = {**config, "configurable": {
+                **config.get("configurable", {}),
+                "run_trace_call_id": tool_call.get("id", ""),
+            }}
+        else:
+            trace_config = config
+
         # 2026-10 修复：之前这里是 tools_by_name[tool_call["name"]] 的裸索引，
         # 模型一旦产生幻觉调用了不存在的工具名就会抛未捕获的 KeyError，
         # 把整个 researcher_tools 节点崩掉（已经在诊断阶段用真实的
@@ -740,6 +809,9 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             )
 
         if tool_failure_counts.get(name, 0) >= configurable.tool_circuit_breaker_threshold:
+            run_trace.emit("breaker_block", config=trace_config, research_topic=research_topic,
+                            tool=name, status="error", failure_kind="infrastructure_error",
+                            reason="circuit_breaker_open")
             return (
                 f"Error executing tool: '{name}' has failed "
                 f"{tool_failure_counts[name]} times in a row during this "
@@ -754,11 +826,24 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         try:
             content, status, failure_kind, attempts = await asyncio.wait_for(
                 execute_tool_safely(
-                    tools_by_name[name], tool_call["args"], config, configurable
+                    tools_by_name[name], tool_call["args"], trace_config, configurable,
+                    research_topic=research_topic,
                 ),
                 timeout=configurable.tool_call_timeout_seconds,
             )
         except asyncio.TimeoutError:
+            # 2026-10 B3：execute_tool_safely内部被asyncio.wait_for取消时，
+            # 正在执行中的那次attempt来不及自己发tool_end（协程被cancel，
+            # 根本没跑到_log_tool_attempt/emit那一行）——这里补发一条
+            # status="outer_timeout"的tool_end，填上这个缺口。call_id和
+            # 那次被取消的attempt共享同一个tool_call["id"]，summarize_
+            # trace.py按(researcher_id, tool, call_id)配对时能对上；如果
+            # 取消恰好发生在两次重试之间的backoff sleep窗口（没有新attempt
+            # 在执行），这条补发的tool_end就没有对应的tool_start——这是
+            # 已知局限，见run_trace.py模块文档字符串。
+            run_trace.emit("tool_end", config=trace_config, research_topic=research_topic,
+                            tool=name, status="outer_timeout", failure_kind="infrastructure_error",
+                            reason="outer_timeout")
             # 没有自带超时保护的工具的安全网，覆盖的是 execute_tool_safely
             # 整个调用（包括它内部的重试循环和退避等待），不只是单次尝试。
             # 对已有内部超时的三个自建工具（sql_executor 5s / python_executor
@@ -826,6 +911,9 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             "research_topic": research_topic,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        run_trace.emit("degradation", config=config, research_topic=research_topic,
+                        tool=tool_call["name"], attempt=attempts, status="error",
+                        failure_kind=failure_kind, reason=degradation_reason)
 
     # 2026-10 T3 新增：fetched_sources——只从 ToolMessage 的真实返回内容里
     # 抽取URL，不从 raw_notes 解析（raw_notes 混了 AI 消息，AI 消息里的URL

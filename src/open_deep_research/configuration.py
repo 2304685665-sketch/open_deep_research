@@ -116,6 +116,33 @@ class Configuration(BaseModel):
             }
         }
     )
+    run_trace_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "是否开启本地JSONL执行轨迹记录（B3新增，见run_trace.py）。默认关闭，"
+                    "开启后还必须同时配置run_trace_dir才会真正写文件——只开这一个开关、"
+                    "不配目录，视为未启用（记一条warning，不写任何文件）。"
+                )
+            }
+        }
+    )
+    run_trace_dir: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "string",
+                "default": None,
+                "description": (
+                    "run_trace_enabled=True时，JSONL轨迹文件的落盘目录。没有默认值——"
+                    "必须显式配置，避免在没人注意的情况下悄悄写到某个固定路径。"
+                )
+            }
+        }
+    )
     allow_clarification: bool = Field(
         default=True,
         metadata={
