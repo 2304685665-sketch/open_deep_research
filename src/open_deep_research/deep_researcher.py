@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from typing import Callable, Literal
 
 from langchain.chat_models import init_chat_model
@@ -18,6 +20,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from open_deep_research.citation_verification import verify_citations
 from open_deep_research.memory_manager import save_memory, search_memory, DEMO_USER_ID
 from open_deep_research.configuration import (
     Configuration,
@@ -351,13 +354,28 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             
             # Aggregate raw notes from all research results
             raw_notes_concat = "\n".join([
-                "\n".join(observation.get("raw_notes", [])) 
+                "\n".join(observation.get("raw_notes", []))
                 for observation in tool_results
             ])
-            
+
             if raw_notes_concat:
                 update_payload["raw_notes"] = [raw_notes_concat]
-                
+
+            # 2026-10 T3 新增：degradation_events/fetched_sources 用 extend 合并，
+            # **不**像 raw_notes 那样 join 成一个无结构字符串——每条事件/来源
+            # 本身已经是带 research_topic 归属的结构化dict，join 成字符串会
+            # 丢失"哪个并行研究方向产生的"这个关键信息（这正是T3诊断阶段
+            # 发现的 raw_notes 现有合并方式的问题，这里刻意不重蹈覆辙）。
+            degradation_events_from_researchers = []
+            fetched_sources_from_researchers = []
+            for observation in tool_results:
+                degradation_events_from_researchers.extend(observation.get("degradation_events", []))
+                fetched_sources_from_researchers.extend(observation.get("fetched_sources", []))
+            if degradation_events_from_researchers:
+                update_payload["degradation_events"] = degradation_events_from_researchers
+            if fetched_sources_from_researchers:
+                update_payload["fetched_sources"] = fetched_sources_from_researchers
+
         except Exception as e:
             # Handle research execution errors
             if is_token_limit_exceeded(e, configurable.research_model) or True:
@@ -509,10 +527,12 @@ def _log_tool_attempt(
 
 async def execute_tool_safely(
     tool, args, config, configurable: "Configuration | None" = None
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, int]:
     """执行单个工具调用，对分类为瞬时性的失败做有限次数的指数退避重试。
 
-    返回 (content, status, failure_kind) 三元组。这是 2026-10 的一次修正：
+    返回 (content, status, failure_kind, attempts) 四元组（2026-10 T3 新增
+    attempts——记的是这次调用总共尝试了几次，给 researcher_tools 记录
+    degradation_events 用，不是单独统计重试次数的另一套机制）。这是 2026-10 的一次修正：
     之前只返回 content 字符串，熔断逻辑被迫靠"看起来像不像错误"（status）去
     判断要不要计入熔断——这是错的：sql_executor 把原始报错返回给模型自我
     纠错是设计本身的一部分，模型探索表结构时连续写错几条 SQL 非常正常，不该
@@ -559,11 +579,11 @@ async def execute_tool_safely(
         except Exception as e:
             _log_tool_attempt(tool_name, attempt=1, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
-            return f"Error executing tool: {str(e)}", "error", "infrastructure_error"
+            return f"Error executing tool: {str(e)}", "error", "infrastructure_error", 1
         content, status, failure_kind = _classify_clean_return(result)
         _log_tool_attempt(tool_name, attempt=1, failure_kind=failure_kind,
                            duration_s=time.monotonic() - t0, will_retry=False)
-        return content, status, failure_kind
+        return content, status, failure_kind, 1
 
     attempt = 0
     while True:
@@ -578,13 +598,13 @@ async def execute_tool_safely(
             # 这类线程堆积）。
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
-            return str(e), "error", "infrastructure_error"
+            return str(e), "error", "infrastructure_error", attempt
         except (TransientToolError,) + TRANSIENT_NETWORK_EXCEPTION_TYPES as e:
             will_retry = attempt <= max_retries
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=will_retry)
             if not will_retry:
-                return str(e), "error", "infrastructure_error"
+                return str(e), "error", "infrastructure_error", attempt
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
         except Exception as e:
             # 未被分类成瞬时性错误的其他异常——不重试，直接返回，算
@@ -592,12 +612,12 @@ async def execute_tool_safely(
             # 工具按自己的逻辑产出的、可以理解的"输入有问题"）。
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind="infrastructure_error",
                                duration_s=time.monotonic() - t0, will_retry=False)
-            return f"Error executing tool: {str(e)}", "error", "infrastructure_error"
+            return f"Error executing tool: {str(e)}", "error", "infrastructure_error", attempt
         else:
             content, status, failure_kind = _classify_clean_return(result)
             _log_tool_attempt(tool_name, attempt=attempt, failure_kind=failure_kind,
                                duration_s=time.monotonic() - t0, will_retry=False)
-            return content, status, failure_kind
+            return content, status, failure_kind, attempt
 
 
 # 各工具已有的错误字符串前缀——仅用于给 ToolMessage 设置展示性的 status 字段
@@ -678,8 +698,10 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     # 保证了这一点（和 tool_call_iterations 走的是同一条路）。
     tool_failure_counts = dict(state.get("tool_failure_counts", {}))
 
-    async def _run_one(tool_call: dict) -> tuple[str, str, str]:
-        """返回 (content, status, failure_kind)。
+    research_topic = state.get("research_topic", "")
+
+    async def _run_one(tool_call: dict) -> tuple[str, str, str, "str | None", "int | None"]:
+        """返回 (content, status, failure_kind, degradation_reason, attempts)。
 
         status 只取 "success" / "error"，纯展示性。
         failure_kind 取 "none" / "tool_input_error" / "infrastructure_error"，
@@ -689,6 +711,16 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         跳过未知工具名，不会让它污染任何真实工具的计数；"已被熔断"的情况下
         继续累加 infrastructure_error 计数也无害（只会让计数继续增长，不影响
         "是否 >= 阈值"这个判断）。
+
+        degradation_reason（2026-10 T3 新增）只在真正需要记 degradation_event
+        时才非None："circuit_breaker_open"（熔断已经打开，本次调用被直接拦
+        截，工具根本没被真的调用）或"retries_exhausted"（execute_tool_safely
+        内部重试全部用尽，或被外层安全超时打断）。幻觉工具名**不**算
+        source_unavailable——那是"根本没有这个源"，不是"这个源不可用"，
+        语义不同，这里刻意不记（范围边界，已在汇报里单独说明）。
+        attempts 对应 degradation_reason 非None 时的真实尝试次数；外层超时
+        打断的情况下不知道内部具体跑到第几次，用 None 如实表示"未知"，不
+        瞎猜一个数字凑数。
         """
         name = tool_call["name"]
 
@@ -703,6 +735,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 f"Available tools: {available}",
                 "error",
                 "infrastructure_error",
+                None,
+                None,
             )
 
         if tool_failure_counts.get(name, 0) >= configurable.tool_circuit_breaker_threshold:
@@ -713,10 +747,12 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 "rest of it.",
                 "error",
                 "infrastructure_error",
+                "circuit_breaker_open",
+                0,  # 熔断拦截，工具这次根本没被真的调用，尝试次数是0
             )
 
         try:
-            content, status, failure_kind = await asyncio.wait_for(
+            content, status, failure_kind, attempts = await asyncio.wait_for(
                 execute_tool_safely(
                     tools_by_name[name], tool_call["args"], config, configurable
                 ),
@@ -733,19 +769,30 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             # kill + 轮询确认）干净地返回，不依赖这里的 cancel 去做清理。
             # 这是"执行环境异常导致的超时"，不是代码本身的问题，算
             # infrastructure_error。
+            # 2026-10 修正（审查意见）：degradation_reason 用独立的
+            # "outer_timeout"，不能和execute_tool_safely内部重试循环真的
+            # 跑完、确认失败的"retries_exhausted"混用同一个值——两者的
+            # 确定性不一样：retries_exhausted时我们确实知道工具被真的调用过
+            # 、失败过N次；outer_timeout时我们只知道"没在限定时间内跑完"，
+            # 不知道它是卡住了、还是终究会成功，不能说这是"数据源不可用"，
+            # 只能说"这次调用没有在限定时间内完成"。两个reason分开后，
+            # 披露小节才能用不同措辞分别处理（见 _DEGRADATION_REASON_TEXT）。
             return (
                 f"Error executing tool: '{name}' did not complete within "
                 f"{configurable.tool_call_timeout_seconds}s (outer safety "
                 "timeout).",
                 "error",
                 "infrastructure_error",
+                "outer_timeout",
+                None,  # 外层超时打断，不知道内部具体跑到第几次，如实标None
             )
 
-        return content, status, failure_kind
+        degradation_reason = "retries_exhausted" if failure_kind == "infrastructure_error" else None
+        return content, status, failure_kind, degradation_reason, attempts
 
     results = await asyncio.gather(*(_run_one(tc) for tc in tool_calls))
 
-    # 更新熔断计数：只看 failure_kind，不看 status（这是本轮修复的核心）。
+    # 更新熔断计数：只看 failure_kind，不看 status（这是T2修复的核心）。
     #   infrastructure_error -> 计数 +1
     #   tool_input_error     -> 计数不变（既不清零也不增加——SQL写错/代码
     #                            报错是模型自我纠错流程的正常部分，不该让它
@@ -753,7 +800,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
     #                            成功"而被当成"这个工具现在没问题了"）
     #   none（真正成功）      -> 计数清零
     # 幻觉工具名不计入任何真实工具的失败计数（见 _run_one 的说明）。
-    for (_, _, failure_kind), tool_call in zip(results, tool_calls):
+    for (_, _, failure_kind, _, _), tool_call in zip(results, tool_calls):
         name = tool_call["name"]
         if name not in tools_by_name:
             continue
@@ -763,6 +810,55 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             tool_failure_counts[name] = 0
         # failure_kind == "tool_input_error"：有意不做任何改动。
 
+    # 2026-10 T3 新增：degradation_events——只在 degradation_reason 非None时
+    # 才记一条，结构见 state.py 的字段注释。原始事件全部保留，不在这里去重
+    # （去重是最终报告披露小节的责任，不是事件记录本身的责任）。
+    degradation_events = []
+    for (_, _, failure_kind, degradation_reason, attempts), tool_call in zip(results, tool_calls):
+        if degradation_reason is None:
+            continue
+        degradation_events.append({
+            "type": "source_unavailable",
+            "source": tool_call["name"],
+            "reason": degradation_reason,
+            "failure_kind": failure_kind,
+            "attempts": attempts,
+            "research_topic": research_topic,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # 2026-10 T3 新增：fetched_sources——只从 ToolMessage 的真实返回内容里
+    # 抽取URL，不从 raw_notes 解析（raw_notes 混了 AI 消息，AI 消息里的URL
+    # 可能是模型自己编的，不是真的抓取过的）。这里匹配的是 tavily_search 自己
+    # 固定的输出格式（utils.py 里 "URL: {url}\n\n" 这一行，逐字核对过源码），
+    # 不是对任意文本做关键词猜测——这是解析一个我们读过、确认稳定的结构化
+    # 输出格式，范围严格限定在这一个已知格式上。
+    # 已知局限：Anthropic/OpenAI 的 native websearch 结果不经过 ToolMessage
+    # （直接是AIMessage自己的content block/annotation，openai_websearch_called/
+    # anthropic_websearch_called 这两个函数就是为了检测这种情况而存在的）——
+    # 当前 search_api 配置默认是 SearchAPI.TAVILY（configuration.py:144），
+    # 这是本机 .env 实际在用的（TAVILY_API_KEY 已配置）；如果换成 Anthropic/
+    # OpenAI 原生搜索，这里的 fetched_sources 提取不会覆盖那些来源，不是静默
+    # 漏掉——这段注释就是明确声明。
+    # 2026-10 T3 修正（测试过程中真实复现过的bug，不是猜的）：ResearchComplete
+    # 这个工具本身也在 tools_by_name 里、会被当成普通工具走到这里——
+    # tool(ResearchComplete).ainvoke({}) 返回的不是字符串，是一个
+    # ResearchComplete() 模型实例本身（status仍然是"success"，因为没有异常
+    # 逃出来）。之前只有 ToolMessage 的构造函数会碰到这个值，它的校验器会把
+    # 非字符串内容悄悄处理掉，从来没出过问题；但这里是新加的第二个消费者，
+    # 直接对 content 做 re.findall 会在 status=="success" 且 content 不是
+    # 字符串时崩掉。加 isinstance 保护，不是因为"可能"发生，是已经真实踩到过。
+    fetched_sources = []
+    for (content, status, failure_kind, _, _), tool_call in zip(results, tool_calls):
+        if status != "success" or not isinstance(content, str):
+            continue
+        for url in re.findall(r"^URL: (\S+)$", content, re.MULTILINE):
+            fetched_sources.append({
+                "source": tool_call["name"],
+                "url": url,
+                "research_topic": research_topic,
+            })
+
     # Create tool messages from execution results
     tool_outputs = [
         ToolMessage(
@@ -771,7 +867,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             tool_call_id=tool_call["id"],
             status=status,
         )
-        for (content, status, _), tool_call in zip(results, tool_calls)
+        for (content, status, _, _, _), tool_call in zip(results, tool_calls)
     ]
 
     # Step 3: Check late exit conditions (after processing tools)
@@ -788,6 +884,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             update={
                 "researcher_messages": tool_outputs,
                 "tool_failure_counts": tool_failure_counts,
+                "degradation_events": degradation_events,
+                "fetched_sources": fetched_sources,
             }
         )
 
@@ -797,6 +895,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         update={
             "researcher_messages": tool_outputs,
             "tool_failure_counts": tool_failure_counts,
+            "degradation_events": degradation_events,
+            "fetched_sources": fetched_sources,
         }
     )
 
@@ -896,24 +996,165 @@ researcher_builder.add_edge("compress_research", END)      # Exit point after co
 # Compile researcher subgraph for parallel execution by supervisor
 researcher_subgraph = researcher_builder.compile()
 
+def _dedupe_degradation_events(degradation_events: list[dict]) -> list[dict]:
+    """按 (source, research_topic, reason) 去重，保留第一次出现的那条（含
+    timestamp等其它字段，但去重判断本身不看timestamp）。原始事件列表本身
+    不受影响，这个函数只用于生成披露小节/提示时的展示，不修改state。"""
+    seen = set()
+    deduped = []
+    for event in degradation_events:
+        key = (event.get("source"), event.get("research_topic"), event.get("reason"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(event)
+    return deduped
+
+
+_DEGRADATION_SECTION_MARKER = "## 数据源可用性说明"
+
+_DEGRADATION_REASON_TEXT = {
+    "retries_exhausted": "重试后仍然不可用",
+    "circuit_breaker_open": "连续失败后在本次任务中被暂时标记为不可用",
+    # 2026-10 修正（审查意见）：outer_timeout 时我们只知道"没在限定时间内
+    # 跑完"，不知道这个数据源到底是不可用还是只是慢——不能断言"不可用"，
+    # 只能如实描述成"这次调用失败"，具体次数/原因码在 _event_detail_text
+    # 里附加说明，不在这里断言任何确定性结论。
+    "outer_timeout": "调用失败（未在限定时间内完成，无法确定数据源本身是否可用）",
+}
+
+
+def _event_detail_text(event: dict) -> str:
+    """单条事件的措辞。outer_timeout 需要额外注明尝试次数和原因码——
+    因为这条reason本身就是"不下确定性断言"，必须把依据（次数未知/原因码）
+    摆出来，不能只留一句模糊的话。其余reason已经是确定性结论（真的被
+    调用过且失败过），不需要这个额外说明。"""
+    reason = event.get("reason")
+    reason_text = _DEGRADATION_REASON_TEXT.get(reason, str(reason))
+    if reason == "outer_timeout":
+        attempts = event.get("attempts")
+        attempts_text = "未知" if attempts is None else str(attempts)
+        return f"{reason_text}（尝试次数：{attempts_text}，原因码：{reason}）"
+    return reason_text
+
+
+def _format_degradation_disclosure(deduped_events: list[dict]) -> str:
+    # 小节导语本身不下任何确定性结论（不说"不可用"）——具体是"确实不可用"
+    # 还是"调用失败、无法确定是否可用"，由下面每一条各自的措辞决定
+    # （见 _event_detail_text），导语只负责提示"相关结论可能受影响"这件事。
+    lines = [f"\n\n{_DEGRADATION_SECTION_MARKER}\n",
+             "本次研究过程中，以下数据源出现过异常情况，相关结论可能受此影响（具体情况见各条说明）：\n"]
+    for event in deduped_events:
+        topic = event.get("research_topic") or "（未指定研究方向）"
+        lines.append(f"- **{event.get('source')}**（研究方向：{topic}）：{_event_detail_text(event)}")
+    return "\n".join(lines)
+
+
+def _append_degradation_disclosure(final_report_text: str, degradation_events: list[dict]) -> str:
+    """程序兜底追加固定标题小节。幂等：
+    - degradation_events 为空 -> 原样返回，不改一个字节。
+    - final_report_text 里已经出现过固定标题（_DEGRADATION_SECTION_MARKER）
+      -> 原样返回，不重复追加（防止这个函数意外被调用多次时重复累加）。
+    去重按 (source, research_topic, reason)；timestamp 不出现在小节里。
+    """
+    if not degradation_events:
+        return final_report_text
+    if _DEGRADATION_SECTION_MARKER in final_report_text:
+        return final_report_text
+    deduped = _dedupe_degradation_events(degradation_events)
+    if not deduped:
+        return final_report_text
+    return final_report_text + _format_degradation_disclosure(deduped)
+
+
+def _build_degradation_prompt_hint(degradation_events: list[dict]) -> str:
+    """提示注入用：生成一段追加进findings的文本，提示模型主动在报告里披露
+    数据源限制——这是"尽量让模型自己写得自然"的那一层，不保证模型一定照做，
+    真正保证一定出现的是 _append_degradation_disclosure 这个程序化兜底。
+    events为空时返回空字符串，不往findings里加任何东西。
+    """
+    deduped = _dedupe_degradation_events(degradation_events)
+    if not deduped:
+        return ""
+    lines = ["\n\n[系统观测到的数据源可用性事实，请在报告中如实、自然地披露这些限制，"
+             "不要忽略也不要淡化]"]
+    for event in deduped:
+        topic = event.get("research_topic") or "（未指定研究方向）"
+        lines.append(f"- 工具 {event.get('source')}（研究方向：{topic}）：{_event_detail_text(event)}")
+    return "\n".join(lines)
+
+
+_CITATION_VERIFICATION_SECTION_MARKER = "## 引用可追溯性核验"
+
+
+def _format_citation_verification_disclosure(verification: dict) -> str:
+    """只标记，不删除——citation_verification.verify_citations是纯离线的
+    结构化比对，这里只是把它的invalid部分渲染成文字，不改final_report正文
+    里已经写好的任何一句话。
+
+    2026-10 修正（审查意见）：只渲染invalid，不渲染missing。
+    - 措辞改成中性的"未能匹配到"，不写"可能是生成报告时产生的错误"——
+      我们的匹配规则本身是保守的结构化比对（见normalize_url的文档字符串：
+      "归一化不掉的差异就判定为不同URL，不做启发式近似匹配"），一个URL被
+      判成invalid，更可能是匹配规则本身比较严格导致的false positive，
+      不应该直接断言"这是模型编造的错误"。
+    - missing（真实检索到但报告没引用）不在最终报告里展示——verify_citations
+      的返回值本身仍然完整计算并保留missing（供评测/日志等其它消费方用），
+      只是"要不要把missing写进报告正文给读者看"这件事本身，和"报告里有没有
+      不可追溯的引用"是两个不同严重程度的问题，这里只改渲染条件，不改
+      verify_citations的计算/返回结构。
+    """
+    if not verification["invalid"]:
+        return ""
+    lines = [
+        f"\n\n{_CITATION_VERIFICATION_SECTION_MARKER}\n",
+        "以下引用链接未能在本次检索记录中匹配到（匹配规则较保守，请自行核实）：\n",
+    ]
+    for url in verification["invalid"]:
+        lines.append(f"- {url}")
+    return "\n".join(lines)
+
+
+def _append_citation_verification_disclosure(final_report_text: str, fetched_sources: list[dict]) -> str:
+    """程序兜底追加固定标题小节。幂等：
+    - fetched_sources 为空 -> 原样返回，不改一个字节——没有任何真实检索
+      记录可做比对依据时，不应该产出任何可能误导的结论。
+    - final_report_text 里已经出现过固定标题 -> 原样返回，不重复追加。
+    - verify_citations 结果里 invalid 为空 -> 原样返回，不追加任何小节
+      （2026-10修正：只看invalid，不再看missing——"存在未引用的已检索来源"
+      不足以让最终报告多一段披露，只有"报告里有链接匹配不到检索记录"才值得
+      提醒读者；missing仍然被verify_citations完整计算并返回，只是不写进
+      最终报告正文）。
+    """
+    if not fetched_sources:
+        return final_report_text
+    if _CITATION_VERIFICATION_SECTION_MARKER in final_report_text:
+        return final_report_text
+    verification = verify_citations(final_report_text, fetched_sources)
+    if not verification["invalid"]:
+        return final_report_text
+    return final_report_text + _format_citation_verification_disclosure(verification)
+
+
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report with retry logic for token limits.
-    
-    This function takes all collected research findings and synthesizes them into a 
+
+    This function takes all collected research findings and synthesizes them into a
     well-structured, comprehensive final report using the configured report generation model.
-    
+
     Args:
         state: Agent state containing research findings and context
         config: Runtime configuration with model settings and API keys
-        
+
     Returns:
         Dictionary containing the final report and cleared state
     """
     # Step 1: Extract research findings and prepare state cleanup
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
-    findings = "\n".join(notes)
-    
+    degradation_events = state.get("degradation_events", [])
+    findings = "\n".join(notes) + _build_degradation_prompt_hint(degradation_events)
+
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
     writer_model_config = {
@@ -922,12 +1163,15 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
         "api_key": get_api_key_for_model(configurable.final_report_model, config),
         "tags": ["langsmith:nostream"]
     }
-    
+
     # Step 3: Attempt report generation with token limit retry logic
     max_retries = 3
     current_retry = 0
     findings_token_limit = None
-    
+    result = None  # 2026-10 T3：不再在循环内部直接return，统一收集到这里，
+    # 循环结束后只在一个地方对 final_report 文本做一次披露小节追加
+    # （approved design: "重试循环之后，对最终字符串做一次"）。
+
     while current_retry <= max_retries:
         try:
             # Create comprehensive prompt with all research context
@@ -937,56 +1181,72 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 findings=findings,
                 date=get_today_str()
             )
-            
+
             # Generate the final report
             final_report = await configurable_model.with_config(writer_model_config).ainvoke([
                 HumanMessage(content=final_report_prompt)
             ])
-            
-            # Return successful report generation
-            return {
-                "final_report": final_report.content, 
+
+            result = {
+                "final_report": final_report.content,
                 "messages": [final_report],
                 **cleared_state
             }
-            
+            break
+
         except Exception as e:
             # Handle token limit exceeded errors with progressive truncation
             if is_token_limit_exceeded(e, configurable.final_report_model):
                 current_retry += 1
-                
+
                 if current_retry == 1:
                     # First retry: determine initial truncation limit
                     model_token_limit = get_model_token_limit(configurable.final_report_model)
                     if not model_token_limit:
-                        return {
+                        result = {
                             "final_report": f"Error generating final report: Token limit exceeded, however, we could not determine the model's maximum context length. Please update the model map in deep_researcher/utils.py with this information. {e}",
                             "messages": [AIMessage(content="Report generation failed due to token limits")],
                             **cleared_state
                         }
+                        break
                     # Use 4x token limit as character approximation for truncation
                     findings_token_limit = model_token_limit * 4
                 else:
                     # Subsequent retries: reduce by 10% each time
                     findings_token_limit = int(findings_token_limit * 0.9)
-                
+
                 # Truncate findings and retry
                 findings = findings[:findings_token_limit]
                 continue
             else:
                 # Non-token-limit error: return error immediately
-                return {
+                result = {
                     "final_report": f"Error generating final report: {e}",
                     "messages": [AIMessage(content="Report generation failed due to an error")],
                     **cleared_state
                 }
-    
-    # Step 4: Return failure result if all retries exhausted
-    return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [AIMessage(content="Report generation failed after maximum retries")],
-        **cleared_state
-    }
+                break
+
+    if result is None:
+        # Step 4: Return failure result if all retries exhausted
+        result = {
+            "final_report": "Error generating final report: Maximum retries exceeded",
+            "messages": [AIMessage(content="Report generation failed after maximum retries")],
+            **cleared_state
+        }
+
+    # 重试循环之后，对最终字符串做一次披露小节追加——幂等，events为空或
+    # 小节已存在时原样返回，见 _append_degradation_disclosure 的文档字符串。
+    result["final_report"] = _append_degradation_disclosure(
+        result["final_report"], degradation_events
+    )
+    # 同样在重试循环之后、只做一次：引用可追溯性核验，纯离线比对，
+    # 只标记不删除，见 _append_citation_verification_disclosure 的文档字符串。
+    fetched_sources = state.get("fetched_sources", [])
+    result["final_report"] = _append_citation_verification_disclosure(
+        result["final_report"], fetched_sources
+    )
+    return result
 
 # Main Deep Researcher Graph Construction
 # Creates the complete deep research workflow from user input to final report

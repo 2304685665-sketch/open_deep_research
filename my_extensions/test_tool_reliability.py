@@ -87,7 +87,7 @@ async def test_first_call_succeeds_no_retry():
         return "ok"
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"python_executor": fake_call}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("python_executor"), {"code": "..."}, {}, _fast_config()
         )
     assert content == "ok"
@@ -112,7 +112,7 @@ async def test_transient_error_recovers_after_retry():
         return "ok after retry"
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"python_executor": fake_call}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("python_executor"), {"code": "..."}, {}, _fast_config(max_attempts=2)
         )
     assert content == "ok after retry"
@@ -135,7 +135,7 @@ async def test_persistent_transient_failure_stops_after_max_retries():
         raise TransientToolError(f"Python Error: attempt {call_count} failed")
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"python_executor": fake_call}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("python_executor"), {"code": "..."}, {}, _fast_config(max_attempts=2)
         )
     # max_attempts=2：首次尝试 + 最多2次重试 = 最多3次调用，不是无限重试
@@ -160,7 +160,7 @@ async def test_permanent_error_does_not_retry():
         raise ValueError("Python Error: Traceback ... SyntaxError: invalid syntax")
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"python_executor": fake_call}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("python_executor"), {"code": "..."}, {}, _fast_config(max_attempts=2)
         )
     assert call_count == 1  # 未被分类为 Transient，不重试
@@ -207,7 +207,7 @@ async def test_empty_result_not_misjudged_as_error():
         return ""  # 合法的"无结果"返回，不是异常
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"internal_doc_search": fake_call}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("internal_doc_search"), {"query": "x"}, {}, _fast_config()
         )
     assert content == ""
@@ -579,7 +579,7 @@ async def test_internal_doc_search_timeout_is_infrastructure_error_and_not_retri
         )
 
     with patch.dict(_RETRY_AWARE_TOOL_CALLS, {"internal_doc_search": always_times_out}):
-        content, status, failure_kind = await execute_tool_safely(
+        content, status, failure_kind, attempts = await execute_tool_safely(
             _FakeTool("internal_doc_search"), {"query": "x"}, {}, _fast_config(max_attempts=2)
         )
 
