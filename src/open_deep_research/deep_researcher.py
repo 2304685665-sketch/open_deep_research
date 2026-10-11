@@ -1,6 +1,7 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -704,6 +705,67 @@ def _classify_clean_return(result) -> tuple[str, str, str]:
     return result, "success", "none"
 
 
+# ---------------------------------------------------------------------------
+# B1 循环检测：4个纯函数，不接触任何state/config，方便直接单测边界情况。
+# ---------------------------------------------------------------------------
+
+def _canonical_args(args: dict) -> str:
+    """保守的参数规范化：只做结构层面的标准化，不做任何语义层面的"理解"。
+    - dict键排序（顺序不应该影响判断）。
+    - 字符串值strip()首尾空白（纯格式差异，不是语义差异）。
+    刻意不做：大小写归一——SQL表名、代码变量名、URL路径里的大小写很多
+    时候是语义相关的，统一转小写可能把两个本质不同的调用误判成相同，
+    这是"宁可漏检，不可错判"的保守取向。也不做任何同义词/语序/改写识别——
+    "iPhone 15 pro价格"和"iPhone15 Pro 的价格"在这套规则下是两个不同的
+    签名，检测不到，这是已知局限，不是bug。
+    """
+    def _normalize(v):
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            return {k: _normalize(v[k]) for k in sorted(v.keys())}
+        if isinstance(v, list):
+            return [_normalize(x) for x in v]
+        return v
+    return json.dumps(_normalize(args), sort_keys=True, ensure_ascii=False)
+
+
+def _call_signature(tool_name: str, args: dict) -> str:
+    """一次"模型发起的调用"的规范化签名——同一个签名意味着同一个工具、
+    规范化后完全相同的参数。不区分这次调用最终是成功/失败/被拦截。"""
+    return f"{tool_name}::{_canonical_args(args)}"
+
+
+def _is_repeat_hit(history_with_this_call: list, signature: str, window: int, threshold: int) -> bool:
+    """重复检测：在最近window次模型发起的调用（history_with_this_call
+    已经包含了这次调用本身，调用方负责把这次的signature追加进去再传进来）
+    里，同一个signature出现的次数达到threshold就判定命中。用>=而不是==，
+    避免窗口边界效应导致漏判；在threshold<=window的正常配置下，第1到
+    threshold-1次出现时计数都<threshold（允许执行），恰好第threshold次
+    出现时计数首次达到threshold（判定命中）——这就是"允许执行N-1次，
+    第N次被拦截"的边界语义。
+    """
+    window_slice = history_with_this_call[-window:]
+    return window_slice.count(signature) >= threshold
+
+
+def _is_abab_hit(history_with_this_call: list, cycles: int) -> bool:
+    """ABAB交替检测：最近2*cycles次调用（history_with_this_call已经包含
+    这次调用本身）如果恰好构成A,B,A,B,...,A,B这种严格交替模式（A和B是
+    两个不同的签名），就判定命中——完成这个模式的那次调用（也就是传进来
+    的最后一个元素）被拦截。A-B-A-C这种不是严格交替的序列不会命中（第3
+    项和期望的B不符，直接判空）。"""
+    period = 2 * cycles
+    if len(history_with_this_call) < period:
+        return False
+    tail = history_with_this_call[-period:]
+    a, b = tail[0], tail[1]
+    if a == b:
+        return False
+    expected = [a if i % 2 == 0 else b for i in range(period)]
+    return tail == expected
+
+
 async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Command[Literal["researcher", "compress_research"]]:
     """Execute tools called by the researcher, including search tools and strategic thinking.
     
@@ -754,6 +816,17 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
 
     research_topic = state.get("research_topic", "")
 
+    # B1 循环检测状态快照——和tool_failure_counts同一种模式：从state读一份
+    # 快照，这一轮算完整的新值再整体写回（不用reducer），天然随每次
+    # researcher_subgraph.ainvoke(...)调用重新开始，并行researcher之间
+    # 互不污染。
+    recent_tool_calls = list(state.get("recent_tool_calls", []))
+    loop_detection_consecutive_hits = state.get("loop_detection_consecutive_hits", 0)
+    _loop_history_max_len = max(
+        configurable.loop_detection_repeat_window,
+        2 * configurable.loop_detection_abab_cycles,
+    )
+
     async def _run_one(tool_call: dict) -> tuple[str, str, str, "str | None", "int | None"]:
         """返回 (content, status, failure_kind, degradation_reason, attempts)。
 
@@ -792,6 +865,47 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             }}
         else:
             trace_config = config
+
+        # B1 循环检测：必须在这里（unknown-tool-name检查、熔断检查、真正
+        # 执行之前）就拦截，才能实现"不执行该调用"这个处置方案。ResearchComplete
+        # 整个排除在检测之外——不管它被调用了多少次、参数是什么，永远不拦截
+        # （而且也不会被计入下面的历史追加，否则会污染其它工具的ABAB判断）。
+        # 幻觉工具名（不在tools_by_name里的）不豁免——模型反复产生同一个
+        # 幻觉调用也是一种值得拦截的循环，检测本身不需要工具真的存在。
+        if configurable.loop_detection_enabled and name != "ResearchComplete":
+            signature = _call_signature(name, tool_call.get("args", {}))
+            candidate = recent_tool_calls + [signature]
+            is_repeat = _is_repeat_hit(
+                candidate, signature,
+                configurable.loop_detection_repeat_window,
+                configurable.loop_detection_repeat_threshold,
+            )
+            is_abab = _is_abab_hit(candidate, configurable.loop_detection_abab_cycles)
+            if is_repeat or is_abab:
+                loop_reason = "repeat" if is_repeat else "abab"
+                run_trace.emit("loop_detected", config=trace_config, research_topic=research_topic,
+                                tool=name, reason=loop_reason)
+                # status="error"（不是"success"）、正文不含"URL:"字样——
+                # 确保不会被下面的fetched_sources提取逻辑误收录（那段逻辑
+                # 只在status=="success"时才扫描内容，这里status是"error"，
+                # 天然被排除，这里的措辞也刻意不用"URL:"这个词）。
+                # failure_kind用一个全新的值"loop_detected"——不是
+                # "infrastructure_error"也不是"none"，下面的熔断计数更新
+                # 循环（只认这两个值）不会被这个值影响，熔断计数原样不变；
+                # degradation_reason（第4个元素）是None，不会进入
+                # degradation_events，不会出现在最终报告的披露章节——循环
+                # 检测不是"数据源不可用"，是模型自己的行为模式问题。
+                return (
+                    f"Loop detected: the exact same call to tool '{name}' (or an "
+                    "alternating pattern with another tool) has repeated too many "
+                    "times without new progress. Please try a different tool, "
+                    "meaningfully different arguments, or call ResearchComplete if "
+                    "you already have enough information.",
+                    "error",
+                    "loop_detected",
+                    None,
+                    None,
+                )
 
         # 2026-10 修复：之前这里是 tools_by_name[tool_call["name"]] 的裸索引，
         # 模型一旦产生幻觉调用了不存在的工具名就会抛未捕获的 KeyError，
@@ -958,14 +1072,46 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for (content, status, _, _, _), tool_call in zip(results, tool_calls)
     ]
 
+    # B1 循环检测：按tool_calls原始顺序重新算一遍这一轮的签名追加进历史——
+    # ResearchComplete整个排除（第1条审批要求：不参与检测，也不计入历史，
+    # 否则会污染其它工具之间的ABAB判断）。截断到max(W, 2*周期数)条，和
+    # 上面读快照时算的_loop_history_max_len是同一个值。是否"这一轮有命中"
+    # 直接看results里有没有任何一个failure_kind=="loop_detected"——这正是
+    # _run_one那个分支返回的标记，不需要另外维护一份"这轮拦截了几次"的
+    # 计数。连续命中计数器按"轮"计（不是按单次调用计）：这一轮只要有命中
+    # 就+1，没有命中就清零。关闭检测时整段跳过——不计算、不改变
+    # recent_tool_calls/loop_detection_consecutive_hits（保持读到的默认
+    # 快照原样写回），确保"关闭时行为与之前完全一致"不只是"结果凑巧一样"，
+    # 而是真的一行多余计算都没发生。
+    if configurable.loop_detection_enabled:
+        new_signatures = [
+            _call_signature(tc["name"], tc.get("args", {}))
+            for tc in tool_calls if tc["name"] != "ResearchComplete"
+        ]
+        recent_tool_calls = (recent_tool_calls + new_signatures)[-_loop_history_max_len:]
+        round_had_loop_hit = any(failure_kind == "loop_detected" for (_, _, failure_kind, _, _) in results)
+        loop_detection_consecutive_hits = (loop_detection_consecutive_hits + 1) if round_had_loop_hit else 0
+
     # Step 3: Check late exit conditions (after processing tools)
     exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
     research_complete_called = any(
         tool_call["name"] == "ResearchComplete"
         for tool_call in most_recent_message.tool_calls
     )
+    # 方案(b)：模型对方案(a)的提示完全没反应，连续命中达到阈值才强制止损——
+    # 不新增独立的state通道，只是把这个条件or进现有的提前退出判断，复用
+    # 同一条goto="compress_research"路径。只写trace（reason="force_stop"），
+    # 不进入最终报告的披露章节（不是"数据源不可用"，不往degradation_events
+    # 里加任何东西）——这一点在已知局限里也会写明。
+    loop_force_stop = (
+        configurable.loop_detection_enabled
+        and loop_detection_consecutive_hits >= configurable.loop_detection_force_stop_after_hits
+    )
+    if loop_force_stop:
+        run_trace.emit("loop_detected", config=config, research_topic=research_topic,
+                        reason="force_stop")
 
-    if exceeded_iterations or research_complete_called:
+    if exceeded_iterations or research_complete_called or loop_force_stop:
         # End research and proceed to compression
         return Command(
             goto="compress_research",
@@ -974,6 +1120,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 "tool_failure_counts": tool_failure_counts,
                 "degradation_events": degradation_events,
                 "fetched_sources": fetched_sources,
+                "recent_tool_calls": recent_tool_calls,
+                "loop_detection_consecutive_hits": loop_detection_consecutive_hits,
             }
         )
 
@@ -985,6 +1133,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             "tool_failure_counts": tool_failure_counts,
             "degradation_events": degradation_events,
             "fetched_sources": fetched_sources,
+            "recent_tool_calls": recent_tool_calls,
+            "loop_detection_consecutive_hits": loop_detection_consecutive_hits,
         }
     )
 

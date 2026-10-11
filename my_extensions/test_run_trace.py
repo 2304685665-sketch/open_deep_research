@@ -308,6 +308,38 @@ def test_summarize_trace_detects_unpaired_tool_end():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_summarize_trace_loop_detected_counts_and_reason_distribution():
+    """B1审查后新增：固定夹具里放3条loop_detected事件（2条repeat、1条
+    force_stop），确认总数和按reason分布的统计都正确，不是只统计总数
+    漏了分布，也不是分布对了总数却算错。"""
+    tmp = tempfile.mkdtemp(prefix="trace_loop_detected_fixture_")
+    try:
+        path = os.path.join(tmp, "fixture.jsonl")
+        fixture_events = [
+            {"run_id": "", "researcher_id": "r1", "call_id": "", "seq": 0, "ts": "t",
+             "event_type": "loop_detected", "research_topic": "T", "tool": "a", "attempt": None,
+             "duration_ms": None, "status": None, "failure_kind": None, "reason": "repeat"},
+            {"run_id": "", "researcher_id": "r1", "call_id": "", "seq": 1, "ts": "t",
+             "event_type": "loop_detected", "research_topic": "T", "tool": "a", "attempt": None,
+             "duration_ms": None, "status": None, "failure_kind": None, "reason": "repeat"},
+            {"run_id": "", "researcher_id": "r1", "call_id": "", "seq": 2, "ts": "t",
+             "event_type": "loop_detected", "research_topic": "T", "tool": None, "attempt": None,
+             "duration_ms": None, "status": None, "failure_kind": None, "reason": "force_stop"},
+        ]
+        with open(path, "w") as f:
+            for e in fixture_events:
+                f.write(json.dumps(e) + "\n")
+
+        result = summarize_trace.summarize(path)
+        assert result["loop_detected_count"] == 3, f"应该恰好3条loop_detected，实际: {result['loop_detected_count']}"
+        assert result["loop_detected_by_reason"] == {"repeat": 2, "force_stop": 1}, (
+            f"按reason分布应该是repeat:2, force_stop:1，实际: {result['loop_detected_by_reason']}"
+        )
+        print("✅ test_summarize_trace_loop_detected_counts_and_reason_distribution 通过")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ===========================================================================
 # 8. 真实编译图：两个并行researcher的事件各自归属到不同researcher_id，
 #    且与各自research_topic一致
@@ -526,6 +558,7 @@ async def main():
     await test_topic_c_real_graph_trace_reproduces_failure_sequence_with_stable_researcher_id()
     test_summarize_trace_on_fixed_fixture()
     test_summarize_trace_detects_unpaired_tool_end()
+    test_summarize_trace_loop_detected_counts_and_reason_distribution()
     await test_parallel_researchers_get_distinct_researcher_ids_matching_their_topics()
     await test_provided_run_trace_run_id_is_consistent_across_all_events()
     await test_disabled_tracing_preserves_config_object_identity()

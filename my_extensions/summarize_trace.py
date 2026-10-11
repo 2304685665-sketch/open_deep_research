@@ -11,6 +11,7 @@
 - 重试次数（retry事件数）
 - 熔断拦截次数（breaker_block事件数）
 - 降级事件数（degradation事件数）
+- 循环检测命中总数+按reason（repeat/abab/force_stop）分布（B1新增）
 - 各工具耗时p50/p95（只用tool_end里duration_ms非None的事件，按tool分组；
   线性插值法，和numpy默认percentile算法一致，对小样本是确定性的）
 - 未配对的tool_start数量 + 未配对的tool_end数量（两个数都报，不只报一个）：
@@ -66,6 +67,8 @@ def summarize(path: str) -> dict:
     retry_count = 0
     breaker_block_count = 0
     degradation_count = 0
+    loop_detected_count = 0
+    loop_detected_by_reason = defaultdict(int)  # B1新增：repeat/abab/force_stop各自的命中次数
 
     # 配对算法：call_id非空时按(researcher_id, tool, call_id)精确分组
     # （逐次归因）；call_id为空时退化成按(researcher_id, tool)分组
@@ -110,6 +113,9 @@ def summarize(path: str) -> dict:
             breaker_block_count += 1
         elif et == "degradation":
             degradation_count += 1
+        elif et == "loop_detected":
+            loop_detected_count += 1
+            loop_detected_by_reason[e.get("reason")] += 1
 
     unpaired_tool_starts = sum(len(v) for v in open_starts.values())
 
@@ -128,6 +134,8 @@ def summarize(path: str) -> dict:
         "retry_count": retry_count,
         "breaker_block_count": breaker_block_count,
         "degradation_count": degradation_count,
+        "loop_detected_count": loop_detected_count,
+        "loop_detected_by_reason": dict(loop_detected_by_reason),
         "duration_ms_by_tool": duration_stats,
         "unpaired_tool_start_count": unpaired_tool_starts,
         "unpaired_tool_end_count": unpaired_tool_ends,
@@ -152,6 +160,7 @@ def main():
     print(f"重试次数: {result['retry_count']}")
     print(f"熔断拦截次数: {result['breaker_block_count']}")
     print(f"降级事件数: {result['degradation_count']}")
+    print(f"循环检测命中总数: {result['loop_detected_count']}（按reason分布: {result['loop_detected_by_reason']}）")
     print("各工具耗时:")
     for tool, stats in result["duration_ms_by_tool"].items():
         print(f"  {tool}: p50={stats['p50_ms']:.1f}ms p95={stats['p95_ms']:.1f}ms (n={stats['count']})")

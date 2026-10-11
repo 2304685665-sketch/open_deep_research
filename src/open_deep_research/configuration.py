@@ -143,6 +143,78 @@ class Configuration(BaseModel):
             }
         }
     )
+    loop_detection_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "是否开启researcher工具调用层的循环检测（B1新增）。默认关闭，"
+                    "不影响任何现有行为。开启后对重复调用/ABAB交替调用做拦截。"
+                )
+            }
+        }
+    )
+    loop_detection_repeat_window: int = Field(
+        default=6,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 6,
+                "min": 2,
+                "max": 20,
+                "description": (
+                    "重复检测的滑动窗口大小W：在最近W次模型发起的调用里统计同一规范化签名的"
+                    "出现次数。注意：W必须>=loop_detection_repeat_threshold才有意义——如果"
+                    "W小于阈值N，窗口里最多只能数到W次，永远达不到N，重复检测会永远不触发"
+                    "（这里不引入配置校验器去阻止这种设置，只是如实在文档里说明，配置者需要"
+                    "自己保证W>=N）。"
+                )
+            }
+        }
+    )
+    loop_detection_repeat_threshold: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 2,
+                "max": 10,
+                "description": (
+                    "重复检测阈值N：同一规范化签名在窗口内第N次出现时，这次调用被拦截（即"
+                    "允许执行N-1次）。注意：如果N大于loop_detection_repeat_window（窗口比"
+                    "阈值还小），窗口里永远数不到N次，重复检测会永远不触发——这不是bug，是"
+                    "这两个参数组合起来天然的数学结果，这里不引入校验器去阻止，只是文档说明。"
+                )
+            }
+        }
+    )
+    loop_detection_abab_cycles: int = Field(
+        default=2,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 2,
+                "min": 2,
+                "max": 6,
+                "description": "ABAB交替检测的周期数M：最近2M次调用恰好构成A,B,A,B,...严格交替时，完成该模式的那次调用被拦截。"
+            }
+        }
+    )
+    loop_detection_force_stop_after_hits: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 3,
+                "min": 1,
+                "max": 10,
+                "description": "连续命中K轮循环检测后（模型对提示没有反应），强制结束该researcher进入压缩。"
+            }
+        }
+    )
     allow_clarification: bool = Field(
         default=True,
         metadata={

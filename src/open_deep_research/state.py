@@ -144,6 +144,22 @@ class ResearcherState(TypedDict):
     tool_failure_counts: dict[str, int] = {}
     degradation_events: Annotated[list[dict], operator.add] = []  # 见 DEGRADATION_EVENT_DOC
     fetched_sources: Annotated[list[dict], operator.add] = []  # 见 FETCHED_SOURCES_DOC
+    # B1 循环检测状态——和 tool_failure_counts 同一种模式（没有 Annotated
+    # 包 reducer，researcher_tools 每次算出完整新值整体写回），天然随每次
+    # researcher_subgraph.ainvoke(...) 调用重新开始，并行researcher之间
+    # 互不污染。不放进 ResearcherOutputState：这两个字段纯粹是researcher
+    # 内部的控制状态，supervisor/最终报告不需要也不应该看到。
+    # recent_tool_calls：最近若干次"模型发起的调用"的规范化签名，按时间
+    # 顺序排列，截断到 max(loop_detection_repeat_window, 2*loop_detection_
+    # abab_cycles) 条（两种检测各自需要的窗口取较大的那个）。execute_
+    # tool_safely 内部的重试不会产生额外条目——这里记的是"_run_one处理完
+    # 一个tool_call"这个粒度，不是"execute_tool_safely内部尝试了几次"。
+    recent_tool_calls: list[str] = []
+    # loop_detection_consecutive_hits：按"轮"计的连续命中计数器——这一轮
+    # （一次researcher_tools调用处理的这一批tool_calls）只要有任意一个
+    # 被循环检测拦截就+1，一个都没有就清零。达到
+    # loop_detection_force_stop_after_hits 时强制结束该researcher。
+    loop_detection_consecutive_hits: int = 0
 
 class ResearcherOutputState(BaseModel):
     """Output state from individual researchers."""
