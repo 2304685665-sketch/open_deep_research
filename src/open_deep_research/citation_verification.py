@@ -91,3 +91,112 @@ def verify_citations(final_report_text: str, fetched_sources: list[dict]) -> dic
     ]
 
     return {"valid": valid, "invalid": invalid, "missing": missing}
+
+
+# ---------------------------------------------------------------------------
+# T3b：内部文档（internal_doc_search）引用的可追溯性核验。
+#
+# 与上面的 URL 核验是两条独立的证据链，刻意不共享代码路径：URL 有通用词法
+# 形式（https?://...），doc_id 没有——这里只能依赖两样东西：
+#   (1) internal_doc_search 自己输出的固定格式（代码生成、结构稳定）；
+#   (2) 报告里模型可能保留下来的 [Source: ...] 标记，以及知识库文件命名约定。
+# (2) 的可靠性明显弱于 URL 提取，局限见 verify_doc_id_citations 的文档字符串。
+# ---------------------------------------------------------------------------
+
+_INTERNAL_DOC_CHUNK_SEPARATOR = "\n\n---\n\n"
+
+# internal_doc_search.py 里每个 chunk 的首行格式（f-string 原样）：
+#   [Source: {doc_id}, section: {section}, relevance_distance: {distance:.3f}]
+_INTERNAL_DOC_HEADER_RE = re.compile(
+    r"^\[Source: (?P<doc_id>[^,\]\s]+), section: .*, relevance_distance: -?\d+(?:\.\d+)?\]$"
+)
+
+# 报告里形如 [Source: <id>, ...] 或 [Source: <id>] 的标记。id 只允许字母数字、
+# 下划线、连字符，可带 .md 后缀；"[Source: https://..."、"[Source: example.com]"、
+# "[Source: Company Handbook]" 都不会匹配，避免把 URL 引用或普通文字误判成 doc_id。
+_REPORT_SOURCE_MARKER_RE = re.compile(
+    r"\[Source:\s*([A-Za-z0-9][A-Za-z0-9_\-]*)(?:\.md)?\s*[,\]]", re.IGNORECASE
+)
+
+# 次级启发式：依赖当前知识库文件命名约定（docNN_description），这个约定不是
+# 任何代码强制的 schema，命名方式变化后这条规则会失效或误报。
+_DOC_ID_NAMING_HEURISTIC_RE = re.compile(r"\bdoc\d{2}_[A-Za-z0-9_]+\b", re.IGNORECASE)
+
+
+def extract_internal_doc_ids(tool_output: str) -> list[str]:
+    """从一次 internal_doc_search 的返回文本里提取 doc_id（去重、保持首次出现顺序）。
+
+    只按 chunk 分隔符切分后解析每个 chunk 的**首行**，不解析 chunk 正文——
+    知识库文档正文里完全可能出现形如 "[Source: ...]" 的文字，那不是检索记录。
+    "No relevant documents found..." 之类没有 chunk 首行的返回，结果为空。
+    调用方负责保证 tool_output 来自 internal_doc_search 的成功返回。
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for chunk in tool_output.split(_INTERNAL_DOC_CHUNK_SEPARATOR):
+        first_line = chunk.split("\n", 1)[0].strip()
+        m = _INTERNAL_DOC_HEADER_RE.match(first_line)
+        if not m:
+            continue
+        doc_id = m.group("doc_id")
+        if doc_id not in seen:
+            seen.add(doc_id)
+            ids.append(doc_id)
+    return ids
+
+
+def _normalize_doc_id(doc_id: str) -> str:
+    doc_id = doc_id.strip().lower()
+    if doc_id.endswith(".md"):
+        doc_id = doc_id[: -len(".md")]
+    return doc_id
+
+
+def extract_cited_doc_ids(final_report_text: str) -> list[str]:
+    """从报告正文里找"看起来像内部文档 doc_id"的引用（归一化为小写、去掉 .md），
+    合并两条规则、去重、保持首次出现顺序：
+      (a) 基于格式：[Source: <id>, ...] / [Source: <id>] 标记；
+      (b) 次级启发式：docNN_xxx 命名约定（依赖当前知识库命名，见上方说明）。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for rx in (_REPORT_SOURCE_MARKER_RE, _DOC_ID_NAMING_HEURISTIC_RE):
+        for m in rx.finditer(final_report_text):
+            raw = m.group(1) if rx is _REPORT_SOURCE_MARKER_RE else m.group(0)
+            norm = _normalize_doc_id(raw)
+            if norm and norm not in seen:
+                seen.add(norm)
+                found.append(norm)
+    return found
+
+
+def verify_doc_id_citations(final_report_text: str, fetched_doc_ids: list[dict]) -> dict:
+    """返回：
+    {
+        "valid":   [doc_id, ...],  # 报告里引用的 doc_id，本次确实被 internal_doc_search 检索到过
+        "invalid": [doc_id, ...],  # 报告里引用的 doc_id，本次检索记录里没有
+        "missing": [doc_id, ...],  # 检索到过，但报告正文完全没出现（仅在返回值里，不写进报告）
+    }
+    只标记，不改报告。
+
+    边界（必须随结果一起理解）：
+    - 只证明“被引用的 doc_id 在本次研究过程中确实被检索到过”，不证明模型对文档
+      内容的转述准确，也不证明文档内容支持报告里的结论。
+    - invalid 的可靠性弱于 URL 核验：模型改写、截断、翻译 doc_id 后的引用检测不到；
+      次级启发式依赖 docNN_ 命名约定。
+    - missing 用“已知 doc_id 字符串是否出现在报告里（不区分大小写）”判断，
+      不依赖上面的启发式。
+    """
+    fetched_norm: dict[str, str] = {}
+    for entry in fetched_doc_ids:
+        norm = _normalize_doc_id(entry.get("doc_id", ""))
+        if norm and norm not in fetched_norm:
+            fetched_norm[norm] = entry.get("doc_id", "")
+
+    cited = extract_cited_doc_ids(final_report_text)
+    valid = [c for c in cited if c in fetched_norm]
+    invalid = [c for c in cited if c not in fetched_norm]
+
+    lowered_report = final_report_text.lower()
+    missing = [orig for norm, orig in fetched_norm.items() if norm not in lowered_report]
+    return {"valid": valid, "invalid": invalid, "missing": missing}

@@ -106,6 +106,23 @@ reducer 同样用 operator.add。
 """
 
 
+FETCHED_DOC_IDS_DOC = """fetched_doc_ids：本次研究过程中 internal_doc_search 工具真实返回过的
+内部文档 doc_id 记录（2026-10 T3b新增，供 citation_verification.verify_doc_id_citations 用）。
+每条是一个dict：{source, doc_id, research_topic}。
+
+刻意与 fetched_sources 分开成独立通道：URL 有通用词法形式，doc_id 没有
+（只能依赖 [Source: ...] 这个由代码生成的固定输出格式，以及知识库文件
+命名约定），两种证据的提取可靠性不同量级，分开标注各自的局限，也保证
+T3 已验证过的 URL 核验路径零改动。
+
+提取范围严格限定：只来自工具名为 internal_doc_search、状态为成功且内容为
+字符串的 ToolMessage；按 chunk 分隔符切分后只解析每个 chunk 的首行，不解析
+chunk 正文，也不解析其他工具的输出。
+
+reducer 同样用 operator.add。
+"""
+
+
 class AgentState(MessagesState):
     """Main agent state containing messages and research data."""
 
@@ -116,6 +133,7 @@ class AgentState(MessagesState):
     final_report: str
     degradation_events: Annotated[list[dict], operator.add] = []  # 见 DEGRADATION_EVENT_DOC
     fetched_sources: Annotated[list[dict], operator.add] = []  # 见 FETCHED_SOURCES_DOC
+    fetched_doc_ids: Annotated[list[dict], operator.add] = []  # 见 FETCHED_DOC_IDS_DOC
 
 class SupervisorState(TypedDict):
     """State for the supervisor that manages research tasks."""
@@ -127,6 +145,7 @@ class SupervisorState(TypedDict):
     raw_notes: Annotated[list[str], override_reducer] = []
     degradation_events: Annotated[list[dict], operator.add] = []  # 见 DEGRADATION_EVENT_DOC
     fetched_sources: Annotated[list[dict], operator.add] = []  # 见 FETCHED_SOURCES_DOC
+    fetched_doc_ids: Annotated[list[dict], operator.add] = []  # 见 FETCHED_DOC_IDS_DOC
 
 class ResearcherState(TypedDict):
     """State for individual researchers conducting research."""
@@ -144,6 +163,7 @@ class ResearcherState(TypedDict):
     tool_failure_counts: dict[str, int] = {}
     degradation_events: Annotated[list[dict], operator.add] = []  # 见 DEGRADATION_EVENT_DOC
     fetched_sources: Annotated[list[dict], operator.add] = []  # 见 FETCHED_SOURCES_DOC
+    fetched_doc_ids: Annotated[list[dict], operator.add] = []  # 见 FETCHED_DOC_IDS_DOC
     # B1 循环检测状态——和 tool_failure_counts 同一种模式（没有 Annotated
     # 包 reducer，researcher_tools 每次算出完整新值整体写回），天然随每次
     # researcher_subgraph.ainvoke(...) 调用重新开始，并行researcher之间
@@ -173,3 +193,4 @@ class ResearcherOutputState(BaseModel):
     # 读代码时确认过的真实边界，不是假设。
     degradation_events: Annotated[list[dict], operator.add] = []  # 见 DEGRADATION_EVENT_DOC
     fetched_sources: Annotated[list[dict], operator.add] = []  # 见 FETCHED_SOURCES_DOC
+    fetched_doc_ids: Annotated[list[dict], operator.add] = []  # 见 FETCHED_DOC_IDS_DOC

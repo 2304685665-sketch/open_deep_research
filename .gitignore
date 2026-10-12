@@ -71,3 +71,7 @@ my_extensions/*.db
 my_extensions/*.txt
 my_extensions/chroma_db/
 my_extensions/eval_results/
+
+# SQLite WAL/SHM sidecar files (never tracked)
+*.db-shm
+*.db-wal

@@ -22,7 +22,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from open_deep_research import run_trace
-from open_deep_research.citation_verification import verify_citations
+from open_deep_research.citation_verification import (
+    extract_internal_doc_ids,
+    verify_citations,
+    verify_doc_id_citations,
+)
 from open_deep_research.memory_manager import save_memory, search_memory, DEMO_USER_ID
 from open_deep_research.configuration import (
     Configuration,
@@ -386,13 +390,17 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             # 发现的 raw_notes 现有合并方式的问题，这里刻意不重蹈覆辙）。
             degradation_events_from_researchers = []
             fetched_sources_from_researchers = []
+            fetched_doc_ids_from_researchers = []
             for observation in tool_results:
                 degradation_events_from_researchers.extend(observation.get("degradation_events", []))
                 fetched_sources_from_researchers.extend(observation.get("fetched_sources", []))
+                fetched_doc_ids_from_researchers.extend(observation.get("fetched_doc_ids", []))
             if degradation_events_from_researchers:
                 update_payload["degradation_events"] = degradation_events_from_researchers
             if fetched_sources_from_researchers:
                 update_payload["fetched_sources"] = fetched_sources_from_researchers
+            if fetched_doc_ids_from_researchers:
+                update_payload["fetched_doc_ids"] = fetched_doc_ids_from_researchers
 
         except Exception as e:
             # Handle research execution errors
@@ -1061,6 +1069,24 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 "research_topic": research_topic,
             })
 
+    # 2026-10 T3b 新增：fetched_doc_ids——只来自工具名为 internal_doc_search、
+    # 状态为成功且内容为字符串的 ToolMessage；按 chunk 切分后只解析每个 chunk
+    # 的首行（见 citation_verification.extract_internal_doc_ids），不解析 chunk
+    # 正文，也不解析其他工具的输出（tavily 抓回的网页正文里完全可能出现
+    # "[Source: ..." 字样，那不是内部文档检索记录）。没调用过该工具时恒为空列表。
+    fetched_doc_ids = []
+    for (content, status, failure_kind, _, _), tool_call in zip(results, tool_calls):
+        if tool_call["name"] != "internal_doc_search":
+            continue
+        if status != "success" or not isinstance(content, str):
+            continue
+        for doc_id in extract_internal_doc_ids(content):
+            fetched_doc_ids.append({
+                "source": tool_call["name"],
+                "doc_id": doc_id,
+                "research_topic": research_topic,
+            })
+
     # Create tool messages from execution results
     tool_outputs = [
         ToolMessage(
@@ -1120,6 +1146,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
                 "tool_failure_counts": tool_failure_counts,
                 "degradation_events": degradation_events,
                 "fetched_sources": fetched_sources,
+                "fetched_doc_ids": fetched_doc_ids,
                 "recent_tool_calls": recent_tool_calls,
                 "loop_detection_consecutive_hits": loop_detection_consecutive_hits,
             }
@@ -1133,6 +1160,7 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
             "tool_failure_counts": tool_failure_counts,
             "degradation_events": degradation_events,
             "fetched_sources": fetched_sources,
+            "fetched_doc_ids": fetched_doc_ids,
             "recent_tool_calls": recent_tool_calls,
             "loop_detection_consecutive_hits": loop_detection_consecutive_hits,
         }
@@ -1374,6 +1402,54 @@ def _append_citation_verification_disclosure(final_report_text: str, fetched_sou
     return final_report_text + _format_citation_verification_disclosure(verification)
 
 
+_DOC_ID_CITATION_SECTION_MARKER = "## 内部文档引用核验"
+
+
+def _report_body_for_doc_verification(final_report_text: str) -> str:
+    """内部文档核验只看报告正文，不看前面已经追加的披露小节——其它小节里
+    可能出现的 URL（路径里碰巧含 docNN_ 之类）或工具名不应被当成 doc_id 引用。
+    """
+    cut = len(final_report_text)
+    for marker in (_DEGRADATION_SECTION_MARKER, _CITATION_VERIFICATION_SECTION_MARKER):
+        idx = final_report_text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    return final_report_text[:cut]
+
+
+def _format_doc_id_citation_disclosure(invalid_ids: list[str]) -> str:
+    """只渲染 invalid，措辞中性（与 URL 核验一致）：doc_id 的提取规则本身比
+    URL 弱（依赖固定输出格式与知识库命名约定），不能断言“这是模型编造的”。
+    """
+    lines = [
+        f"\n\n{_DOC_ID_CITATION_SECTION_MARKER}\n",
+        "以下内部文档引用未能在本次检索记录中匹配到（匹配规则较保守，请自行核实）：\n",
+    ]
+    for doc_id in invalid_ids:
+        lines.append(f"- {doc_id}")
+    return "\n".join(lines)
+
+
+def _append_doc_id_citation_disclosure(final_report_text: str, fetched_doc_ids: list[dict]) -> str:
+    """程序兜底追加固定标题小节，幂等：
+    - fetched_doc_ids 为空（本次研究没成功调用过 internal_doc_search）-> 原样返回，
+      不改一个字节，行为与未引入 T3b 时完全一致；
+    - 报告里已经出现过固定标题 -> 原样返回，不重复追加；
+    - 没有 invalid -> 原样返回（missing 只存在于 verify_doc_id_citations 的返回值）。
+    只证明“被引用的 doc_id 本次确实被检索到过”，不证明文档内容支持报告结论。
+    """
+    if not fetched_doc_ids:
+        return final_report_text
+    if _DOC_ID_CITATION_SECTION_MARKER in final_report_text:
+        return final_report_text
+    verification = verify_doc_id_citations(
+        _report_body_for_doc_verification(final_report_text), fetched_doc_ids
+    )
+    if not verification["invalid"]:
+        return final_report_text
+    return final_report_text + _format_doc_id_citation_disclosure(verification["invalid"])
+
+
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report with retry logic for token limits.
 
@@ -1483,6 +1559,12 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     fetched_sources = state.get("fetched_sources", [])
     result["final_report"] = _append_citation_verification_disclosure(
         result["final_report"], fetched_sources
+    )
+    # 2026-10 T3b：内部文档（internal_doc_search）引用核验，同样只做一次、
+    # 幂等、只标记不删除。fetched_doc_ids 为空时原样返回。
+    fetched_doc_ids = state.get("fetched_doc_ids", [])
+    result["final_report"] = _append_doc_id_citation_disclosure(
+        result["final_report"], fetched_doc_ids
     )
     return result
 
