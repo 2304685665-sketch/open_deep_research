@@ -13,6 +13,8 @@ load_dotenv()
 
 from mem0 import Memory
 
+from open_deep_research.memory_guard import admit_write, filter_read, guard_enabled
+
 _config = {
     "llm": {
         "provider": "openai",
@@ -49,6 +51,12 @@ async def save_memory(text: str, user_id: str) -> dict:
     """
     import asyncio
 
+    if guard_enabled():
+        allowed, reason = admit_write(text)
+        if not allowed:
+            # 被准入过滤拒绝：不是故障，是策略；调用方照常继续主流程
+            return {"success": False, "skipped": True, "reason": reason}
+
     def _run():
         m = _get_memory()
         return m.add(text, user_id=user_id)
@@ -74,6 +82,9 @@ async def search_memory(query: str, user_id: str, limit: int = 3) -> dict:
     try:
         result = await asyncio.to_thread(_run)
         memories = result.get("results", []) if isinstance(result, dict) else result
+        if guard_enabled():
+            memories, dropped = filter_read(memories)
+            return {"success": True, "memories": memories, "dropped": dropped}
         return {"success": True, "memories": memories}
     except Exception as e:
         return {"success": False, "memories": [], "error": f"{type(e).__name__}: {str(e)}"}
