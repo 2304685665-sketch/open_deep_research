@@ -1,8 +1,10 @@
 """eval_retrieval 的离线测试：指标计算是否正确，以及查询集标注本身是否有效。
 不调用任何 API，也不检查任何检索效果。"""
 
+import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eval_retrieval as ev  # noqa: E402
@@ -118,6 +120,199 @@ def test_api_modes_refuse_without_explicit_approval():
     print("✅ test_api_modes_refuse_without_explicit_approval 通过（未批准时 vector/hybrid 均拒绝运行）")
 
 
+def _qs_for_coverage():
+    return [
+        {"id": "m2", "type": "semantic", "query": "x",
+         "targets": [["doc02_synthmotion_product", "技术布局"], ["doc08_meeting_notes_synthmotion", "待观察风险"]], "reason": "r"},
+        {"id": "m3", "type": "semantic", "query": "x",
+         "targets": [["doc02_synthmotion_product", "技术布局"], ["doc08_meeting_notes_synthmotion", "待观察风险"],
+                     ["doc01_synthmotion_intro", "融资历程"]], "reason": "r"},
+        {"id": "s1", "type": "entity", "query": "x", "targets": [["doc01_synthmotion_intro", "融资历程"]], "reason": "r"},
+        {"id": "n", "type": "no_answer", "query": "x", "targets": [], "reason": "r"},
+    ]
+
+
+def test_target_coverage_counts_distinct_targets_and_excludes_single_and_no_answer():
+    qs = _qs_for_coverage()
+    a, b = sorted(ev.target_chunk_ids(qs[0], CHUNKS))
+    c = next(iter(ev.target_chunk_ids(qs[2], CHUNKS)))
+    other = next(x["id"] for x in CHUNKS if x["id"] not in {a, b, c})
+    rk = {"m2": [a, a, a, other, b], "m3": [other, a, b, c], "s1": [c], "n": [a]}
+    res = ev.target_coverage(rk, qs, CHUNKS, ks=(1, 2, 3, 5))
+    ids = [r["id"] for r in res["detail"]]
+    assert ids == ["m2", "m3"], ids  # 单目标与 no_answer 不参与
+    m2, m3 = res["detail"]
+    # m2: 同一目标重复出现不重复计；b 在第 5 名
+    assert [m2[f"coverage@{k}"] for k in (1, 2, 3, 5)] == [0.5, 0.5, 0.5, 1.0]
+    assert m2["n_targets"] == 2
+    # m3: 3 个目标；k=1 无；k=2 得 a；k=3 得 a,b；k=5(超过列表长度) 得全部
+    assert [m3[f"coverage@{k}"] for k in (1, 2, 3, 5)] == [0.0, 1 / 3, 2 / 3, 1.0]
+    assert abs(res["mean"]["coverage@5"] - 1.0) < 1e-9 and res["n_queries"] == 2
+    assert ev.target_coverage({}, qs, CHUNKS)["detail"][0]["coverage@1"] == 0.0  # 缺排名视为空
+    assert ev.target_coverage({}, [qs[2], qs[3]], CHUNKS)["mean"]["coverage@1"] is None  # 无多目标查询
+    print("✅ test_target_coverage_counts_distinct_targets_and_excludes_single_and_no_answer 通过")
+
+
+def test_real_multi_target_queries_are_exactly_the_known_five():
+    multi = sorted(q["id"] for q in QUERIES if q["type"] != "no_answer" and len(ev.target_chunk_ids(q, CHUNKS)) >= 2)
+    assert multi == ["K4", "M4", "S1", "S2", "S7"], multi
+    print("✅ test_real_multi_target_queries_are_exactly_the_known_five 通过")
+
+
+def test_evaluate_output_unchanged_by_new_analysis():
+    import copy
+    qs = _qs_for_coverage()
+    a, b = sorted(ev.target_chunk_ids(qs[0], CHUNKS))
+    rk = {"m2": [b, a], "m3": [a], "s1": ["zzz"], "n": [a]}
+    before = copy.deepcopy(ev.evaluate(rk, qs, CHUNKS))
+    ev.target_coverage(rk, qs, CHUNKS)
+    ev.no_answer_records(rk, qs, CHUNKS, "bm25")
+    assert ev.evaluate(rk, qs, CHUNKS) == before
+    assert before["overall"]["n"] == 3 and "no_answer" not in before["by_type"]
+    assert set(before) == {"overall", "by_type", "detail"}
+    print("✅ test_evaluate_output_unchanged_by_new_analysis 通过")
+
+
+def test_no_answer_records_probe_types_and_distractor_flag():
+    n4 = next(q for q in QUERIES if q["id"] == "N4")
+    dis = next(c["id"] for c in CHUNKS if (c["doc_id"], c["section"]) == ("doc01_synthmotion_intro", "融资历程"))
+    other = next(c["id"] for c in CHUNKS if c["id"] != dis)
+    rk = {q["id"]: [other] for q in QUERIES}
+    rk["N4"] = [other, dis]
+    rec = {r["id"]: r for r in ev.no_answer_records(rk, QUERIES, CHUNKS, "bm25", scores={"N4": {other: 1.5}})}
+    assert sorted(rec) == ["N1", "N2", "N3", "N4", "N5", "N6"], sorted(rec)
+    assert rec["N3"]["analysis_type"] == "index_coverage_probe"
+    assert all(rec[k]["analysis_type"] == "no_answer_probe" for k in ("N1", "N2", "N4", "N5", "N6"))
+    assert rec["N4"]["has_known_distractor"] and not rec["N4"]["top1_is_known_distractor"]
+    assert rec["N4"]["first_distractor_rank"] == 2 and rec["N4"]["top1_score"] == 1.5
+    assert rec["N4"]["top1_chunk_id"] == other and rec["N4"]["mode"] == "bm25"
+    assert not rec["N1"]["has_known_distractor"] and rec["N1"]["top1_score"] is None
+    rk["N4"] = [dis]
+    assert ev.no_answer_records(rk, [n4], CHUNKS, "vector")[0]["top1_is_known_distractor"] is True
+    empty = ev.no_answer_records({}, [n4], CHUNKS, "bm25")[0]  # BM25 无词项重叠 -> 排名为空
+    assert empty["top1_chunk_id"] is None and empty["top1_is_known_distractor"] is False and empty["n_ranked"] == 0
+    # 记录里不含任何"正确/拒答"判断字段
+    assert not {"correct", "abstained", "hit1", "rr"} & set(rec["N4"])
+    print("✅ test_no_answer_records_probe_types_and_distractor_flag 通过")
+
+
+def test_analysis_annotations_refer_to_existing_frozen_queries_and_chunks():
+    qids = {q["id"] for q in QUERIES if q["type"] == "no_answer"}
+    assert ev.INDEX_COVERAGE_PROBES <= qids and set(ev.KNOWN_DISTRACTORS) <= qids
+    have = {(c["doc_id"], c["section"]) for c in CHUNKS}
+    assert all((d, s) in have for v in ev.KNOWN_DISTRACTORS.values() for d, s in v)
+    print("✅ test_analysis_annotations_refer_to_existing_frozen_queries_and_chunks 通过")
+
+
+def test_target_coverage_raises_when_a_target_cannot_map_to_the_index():
+    bad = {"id": "bad", "type": "semantic", "query": "x", "reason": "r",
+           "targets": [["doc02_synthmotion_product", "技术布局"], ["doc99_missing", "不存在"]]}
+    try:
+        ev.target_coverage({}, [bad], CHUNKS)
+    except ValueError as e:
+        assert "bad" in str(e)
+    else:
+        raise AssertionError("目标无法映射到索引时必须报错，而不是静默缩小分母")
+    single_bad = dict(bad, id="sb", targets=[["doc99_missing", "不存在"]])
+    try:
+        ev.target_coverage({}, [single_bad], CHUNKS)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("单目标缺失同样必须报错")
+    print("✅ test_target_coverage_raises_when_a_target_cannot_map_to_the_index 通过")
+
+
+def test_bm25_scores_map_to_the_right_chunks_and_match_ranking():
+    qs = [{"id": "f1", "type": "keyword", "query": "伺服电机", "targets": [], "reason": "r"},
+          {"id": "f2", "type": "keyword", "query": "zzzzqqq不存在的词", "targets": [], "reason": "r"}]
+    sc = ev.bm25_scores(qs, CHUNKS)
+    rk = ev.bm25_rankings(qs, CHUNKS)
+    ids = {c["id"] for c in CHUNKS}
+    assert set(sc["f1"]) == set(rk["f1"]) and set(sc["f1"]) <= ids and all(v > 0 for v in sc["f1"].values())
+    vals = [sc["f1"][c] for c in rk["f1"]]
+    assert vals == sorted(vals, reverse=True), "分数必须与排名同序"
+    assert rk["f1"] and sc["f2"] == {} and rk["f2"] == []
+    print("✅ test_bm25_scores_map_to_the_right_chunks_and_match_ranking 通过")
+
+
+def test_no_answer_records_score_belongs_to_the_top1_chunk_and_no_fake_scores():
+    n4 = next(q for q in QUERIES if q["id"] == "N4")
+    a, b = CHUNKS[0]["id"], CHUNKS[1]["id"]
+    rec = ev.no_answer_records({"N4": [b, a]}, [n4], CHUNKS, "bm25", scores={"N4": {a: 9.0, b: 2.5}})[0]
+    assert rec["top1_chunk_id"] == b and rec["top1_score"] == 2.5 and rec["score_source"] == "bm25"
+    # 没有 scores（vector/hybrid）：不得出现任何分数，也不得声称来源
+    for mode in ("vector", "hybrid"):
+        r = ev.no_answer_records({"N4": [b, a]}, [n4], CHUNKS, mode)[0]
+        assert r["top1_score"] is None and r["score_source"] is None
+    print("✅ test_no_answer_records_score_belongs_to_the_top1_chunk_and_no_fake_scores 通过")
+
+
+def test_build_report_structure_and_provenance_with_fake_data():
+    qs = _qs_for_coverage()
+    a, b = sorted(ev.target_chunk_ids(qs[0], CHUNKS))
+    rk = {"m2": [a, b], "m3": [a], "s1": ["zzz"], "n": [a]}
+    rep = ev.build_report(rk, qs, CHUNKS, "bm25", scores={"n": {a: 1.0}})
+    base = ev.evaluate(rk, qs, CHUNKS)
+    assert {k: rep[k] for k in base} == base, "evaluate() 的原有键必须原样保留"
+    assert set(rep) == {"overall", "by_type", "detail", "mode", "target_coverage", "no_answer_records", "provenance"}
+    assert rep["mode"] == "bm25" and rep["provenance"]["mode"] == "bm25"
+    assert rep["provenance"]["queries_sha256_prefix"] == ev.queries_sha256()[:16]
+    assert rep["provenance"]["queries_sha256_prefix"] == "f24a5e0346995cb4", "冻结 v1 查询集被改动"
+    assert rep["target_coverage"]["n_queries"] == 2 and rep["no_answer_records"][0]["top1_score"] == 1.0
+    json.dumps(rep, ensure_ascii=False)  # 可序列化
+    print("✅ test_build_report_structure_and_provenance_with_fake_data 通过")
+
+
+def test_output_file_is_never_overwritten_without_force():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "r.json")
+        ev.write_result(p, "one")
+        assert open(p, encoding="utf-8").read() == "one"
+        for fn in (lambda: ev.write_result(p, "two"), lambda: ev.check_out_path(p, False)):
+            try:
+                fn()
+            except SystemExit as e:
+                assert "--force" in str(e)
+            else:
+                raise AssertionError("已存在的输出文件必须拒绝覆盖")
+        assert open(p, encoding="utf-8").read() == "one"
+        ev.write_result(p, "three", force=True)
+        assert open(p, encoding="utf-8").read() == "three"
+        ev.check_out_path(os.path.join(d, "new.json"), False)  # 不存在则放行
+        ev.check_out_path(None, False)
+    print("✅ test_output_file_is_never_overwritten_without_force 通过")
+
+
+def test_force_flag_is_output_only_and_checked_before_any_retrieval_work():
+    import inspect
+    src = inspect.getsource(ev.main)
+    assert src.index("check_out_path(") < src.index("load_chunks_and_queries(") < src.index("bm25_rankings(")
+    # 审批判断只依赖 --allow-api 与环境变量，不引用 --force
+    gate = src[src.index("if not (args.allow_api"):src.index("import chromadb")]
+    assert "force" not in gate
+    print("✅ test_force_flag_is_output_only_and_checked_before_any_retrieval_work 通过")
+
+
+def test_fake_openai_key_is_detected_without_echo():
+    old = os.environ.get("OPENAI_API_KEY")
+    try:
+        os.environ["OPENAI_API_KEY"] = "sk-fake-test-key-no-real-network-calls"
+        msg = ev.fake_key_problem()
+        assert msg and "unset OPENAI_API_KEY" in msg and "sk-fake-test" not in msg
+        os.environ["OPENAI_API_KEY"] = "sk-proj-real-looking"
+        assert ev.fake_key_problem() is None
+        os.environ.pop("OPENAI_API_KEY")
+        assert ev.fake_key_problem() is None
+    finally:
+        if old is not None:
+            os.environ["OPENAI_API_KEY"] = old
+    import inspect
+    src = inspect.getsource(ev.main)
+    assert src.index("fake_key_problem()") < src.index("OpenAIEmbeddingFunction(")
+    print("✅ test_fake_openai_key_is_detected_without_echo 通过")
+
+
 def main():
     test_real_kb_has_expected_shape()
     test_every_target_exists_in_the_index()
@@ -127,6 +322,18 @@ def main():
     test_vector_candidate_pool_is_capped_and_never_exceeds_collection_size()
     test_hybrid_only_reorders_the_vector_candidate_pool()
     test_api_modes_refuse_without_explicit_approval()
+    test_target_coverage_counts_distinct_targets_and_excludes_single_and_no_answer()
+    test_real_multi_target_queries_are_exactly_the_known_five()
+    test_evaluate_output_unchanged_by_new_analysis()
+    test_no_answer_records_probe_types_and_distractor_flag()
+    test_analysis_annotations_refer_to_existing_frozen_queries_and_chunks()
+    test_target_coverage_raises_when_a_target_cannot_map_to_the_index()
+    test_bm25_scores_map_to_the_right_chunks_and_match_ranking()
+    test_no_answer_records_score_belongs_to_the_top1_chunk_and_no_fake_scores()
+    test_build_report_structure_and_provenance_with_fake_data()
+    test_output_file_is_never_overwritten_without_force()
+    test_force_flag_is_output_only_and_checked_before_any_retrieval_work()
+    test_fake_openai_key_is_detected_without_echo()
     print("\n全部测试通过！")
 
 
