@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -1393,6 +1394,27 @@ def _build_degradation_prompt_hint(degradation_events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+GROUNDING_GUARD_ENV_VAR = "DEEP_RESEARCH_GROUNDING_GUARD"
+GROUNDING_GUARD_MARKER = "[数据依据硬性要求]"
+
+
+def _grounding_guard_enabled() -> bool:
+    return os.environ.get(GROUNDING_GUARD_ENV_VAR, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_grounding_prompt_hint() -> str:
+    """数据依据约束（默认关闭，DEEP_RESEARCH_GROUNDING_GUARD=1 才追加进 findings）。
+    动机：评测中观察到工具调用额度用尽、关键 SQL 从未成功执行，最终报告却写出库里不存在的轮次/金额/日期，
+    并把未执行的查询列为已执行。这只是提示词层的约束，不保证模型照做，效果以评测对比为准。
+    关闭时返回空字符串，findings 与改动前逐字节一致。"""
+    if not _grounding_guard_enabled():
+        return ""
+    return (f"\n\n{GROUNDING_GUARD_MARKER}报告中的每个具体数字、日期、轮次、名称，必须出现在上面研究笔记里工具的实际返回结果中。"
+            "如果笔记显示某次查询报错、被拒绝或没有执行，就必须在报告里明确写“未取得该数据”，"
+            "不得根据常识、上下文或其他数据补全或推测；不得把没有成功执行的查询写成已执行。"
+            "宁可回答“数据库中没有查到”，也不要给出笔记里没有的数值。")
+
+
 _CITATION_VERIFICATION_SECTION_MARKER = "## 引用可追溯性核验"
 
 
@@ -1510,7 +1532,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     notes = state.get("notes", [])
     cleared_state = {"notes": {"type": "override", "value": []}}
     degradation_events = state.get("degradation_events", [])
-    findings = "\n".join(notes) + _build_degradation_prompt_hint(degradation_events)
+    findings = ("\n".join(notes) + _build_degradation_prompt_hint(degradation_events)
+                + _build_grounding_prompt_hint())
 
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)
