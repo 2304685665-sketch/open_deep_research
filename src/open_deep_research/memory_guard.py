@@ -34,6 +34,34 @@ _INJECTION_PATTERNS = [
     r"(泄露|输出|打印|透露).{0,8}(系统提示|提示词|system prompt)",
     r"(系统提示|提示词|system prompt).{0,8}(泄露|透露|告诉我|发给我|输出|打印)",
     r"从现在起.{0,10}(你是|你将|扮演)",
+    # —— 2026-10 召回修复（按类别，非逐句）——
+    # 覆盖/忽略类动词 + 指令类名词（英文）
+    r"\b(ignore|disregard|forget|override|bypass|discard|overrule|set\s+aside|stop\s+following)\b\W+(?:\w+\W+){0,6}?"
+    r"(instructions?|rules?|guidance|guidelines|prompts?|configuration|restrictions?|safety|polic(?:y|ies)|safeguards?|approval|everything)",
+    r"\b(instructions?|rules?|guidelines|configuration)\b\W+(?:\w+\W+){0,4}?(are|is)\s+(void|invalid|obsolete|null)",
+    r"\b(from\s+now\s+on|from\s+this\s+point\s+on|henceforth)\b\W*(you\s+(will|must|should|shall|are|only)|(only|always)\s+(reply|respond|answer|say|output))",
+    r"\b(act|behave|respond)\s+as\s+(an?\s+)?(unfiltered|unrestricted|jailbroken)\b|\bno\s+restrictions\b|\bwithout\s+(any\s+)?restrictions\b",
+    r"\bpretend\s+(that\s+)?(the\s+)?(previous|prior|system)\b",
+    r"\b(ignore|disregard|forget)\s+(the\s+)?above\b|\bnew\s+(instructions?|rules?)\s*:",
+    r"\byou\s+(must|will)\s+always\s+(include|say|answer|reply|respond|insert|append)\b",
+    r"\b(silently|secretly|quietly|covertly)\s+(forward|send|insert|add|email|post|upload|include)\b|\b(do\s*n[o']t|never)\s+tell\s+the\s+user\b",
+    r"\b(higher|highest|top)\s+priority\s+(than|over)\s+(the\s+)?(system|user|previous)",
+    r"\b(reveal|print|show|leak|output|repeat)\b.{0,20}(hidden\s+instructions|your\s+instructions|system\s+message)",
+    r"\b(run|execute)\b.{0,12}\b(drop\s+table|delete\s+from|truncate)\b",
+    # 角色/分隔符伪装
+    r"(?m)^\s*(system|assistant|human)\s*:", r"^\s*#{2,}\s*system\b", r"={2,}\s*system\s+message", r"<\|im_start\|>", r"\[/?INST\]", r"【系统】",
+    # 中文：覆盖/忽略类动词 + 指令类名词
+    r"(忽略|无视|不要遵守|不必理会|不用理会|作废|覆盖|解除|绕过|跳过|忘记|忘掉|撤销|废除).{0,10}(指令|规则|规定|设定|限制|提示|审批|校验|命令|要求)",
+    r"(从现在起|以后|此后|从此).{0,6}(你必须|你只|你不再|所有回答|每次回答|一律|只需听从|只听)",
+    r"新(的)?(指令|规则)[:：]|按.{0,4}新规则",
+    r"(忘记|忘掉).{0,10}(一切|全部内容|所有内容|所有)",
+    r"进入开发者模式|不再受任何限制|不受(任何)?限制|(不受限制|无限制)的(助手|模型|ai)",
+    r"(偷偷|悄悄|暗中|私下).{0,8}(发送|转发|加入|插入|发给)|(不要|别)告诉用户",
+    r"优先级.{0,3}高于.{0,4}(系统|用户)|优先于.{0,4}系统",
+    r"(打印|输出|透露|泄露|告诉我).{0,12}(隐藏指令|系统指令|初始指令)|(隐藏指令|系统指令).{0,10}(打印|输出)",
+    r"假装.{0,10}(系统提示|之前|以上).{0,6}不存在",
+    r"(服从|听从|只听|遵从)(本条|这条)(记忆|备注|笔记)",
+    r"(执行|运行).{0,6}(drop|delete\s+from|truncate)",
 ]
 _SECRET_PATTERNS = [
     r"\bsk-[A-Za-z0-9_\-]{20,}",
@@ -42,6 +70,12 @@ _SECRET_PATTERNS = [
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     r"(?i)(password|passwd|pwd|api[_\-]?key|secret|access[_\-]?token)\s*[:=：]\s*\S{6,}",
     r"(密码|口令|密钥)\s*(是|为|[:=：])\s*\S{6,}",
+    # —— 2026-10 召回修复 ——
+    r"\bgh[pousr]_[A-Za-z0-9]{30,}",
+    r"\bxox[abprs]-[A-Za-z0-9\-]{10,}",
+    r"\bsk_live_[A-Za-z0-9]{16,}",
+    r"(?i)\b[A-Z_]*(SECRET|TOKEN|PASSWORD|API_?KEY)[A-Z_]*\s*=\s*\S{8,}",
+    r"[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s@]{3,}@",
 ]
 _INJECTION_RE = [re.compile(p, re.I) for p in _INJECTION_PATTERNS]
 _SECRET_RE = [re.compile(p) for p in _SECRET_PATTERNS]
@@ -62,6 +96,30 @@ def _normalize(text: str) -> str:
     t = unicodedata.normalize("NFKC", text)
     t = "".join(ch for ch in t if unicodedata.category(ch) != "Cf")
     return t.translate(_CONFUSABLES)
+
+
+_SPACED_RE = re.compile(r"\b(?:[A-Za-z] ){3,}[A-Za-z]\b")
+_B64_RE = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
+_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+
+
+def _variants(text: str) -> list[str]:
+    """用于匹配的多种还原形态：归一化、去字符间空格、简单 leet、反转、可解码的 base64。
+    只用于匹配，不改写原文。仍然是启发式：拦不住释义改写和多层/自定义编码。"""
+    import base64
+    n = _normalize(text)
+    out = [text, n]
+    out.append(_SPACED_RE.sub(lambda m: m.group(0).replace(" ", ""), n))
+    out.append(n.translate(_LEET))
+    out.append(n[::-1])
+    for tok in _B64_RE.findall(n):
+        try:
+            dec = base64.b64decode(tok + "=" * (-len(tok) % 4), validate=True).decode("utf-8")
+        except Exception:
+            continue
+        if dec.strip():
+            out.append(dec)
+    return out
 
 
 def guard_enabled() -> bool:
@@ -90,13 +148,12 @@ def _has_card_number(text: str) -> bool:
 
 
 def contains_injection(text: str) -> bool:
-    n = _normalize(text)
-    return any(r.search(text) or r.search(n) for r in _INJECTION_RE)
+    return any(r.search(v) for v in _variants(text) for r in _INJECTION_RE)
 
 
 def contains_sensitive(text: str) -> bool:
     n = _normalize(text)
-    return (any(r.search(text) or r.search(n) for r in _SECRET_RE)
+    return (any(r.search(v) for v in (text, n) for r in _SECRET_RE)
             or bool(_CN_ID_RE.search(n)) or _has_card_number(n))
 
 

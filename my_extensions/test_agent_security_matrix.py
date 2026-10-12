@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agent_security_matrix as M
 
-EXPECTED_BYPASS = {"W12", "W15", "W17", "W18", "W19", "W29", "W30", "W31"}   # 释义改写 / 编码 / 插空格
+EXPECTED_BYPASS = {"W12", "W17", "W29", "W30", "W31"}   # 释义改写 / 密钥的编码与插空格（W15/W18/W19 在 2026-10 召回修复后已能拦截）
 EXPECTED_FALSE_POSITIVE = {"W38", "W39", "W40"}                              # 规则型过滤的已知误拦
 
 
@@ -29,7 +29,7 @@ def test_baseline_attacks_never_bypass():
 
 def test_summary_counts():
     s = M.summarize(M.run_matrix())
-    assert s["A.write_admission"] == {"total": 42, "ok": 31, "bypass": 8, "false_positive": 3}
+    assert s["A.write_admission"] == {"total": 42, "ok": 34, "bypass": 5, "false_positive": 3}
     assert s["B.read_filter"] == {"total": 6, "ok": 6, "bypass": 0, "false_positive": 0}
     assert s["C.approval_policy"] == {"total": 12, "ok": 12, "bypass": 0, "false_positive": 0}
     print("✅ test_summary_counts 通过")
