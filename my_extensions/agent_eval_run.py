@@ -415,12 +415,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--relaxed-limits", action="store_true",
                     help="小批量诊断限额预设：并行 2、迭代 3、工具调用 10、结构化输出不重试（与 --pilot-limits 互斥）")
     ap.add_argument("--live", action="store_true", help="发起真实模型调用（还需要 ODR_EVAL_CONFIRM_LIVE=yes）")
+    ap.add_argument("--suite", choices=("main", "heldout"), default="main",
+                    help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
 
     if not (args.budget_usd > 0):
         print("--budget-usd 必须为正数。", file=sys.stderr)
         return 2
-    all_cases = {c["id"]: c for c in agent_eval_cases.build_cases()}
+    if args.suite == "heldout":
+        import agent_eval_cases_heldout
+        all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout_cases()}
+    else:
+        all_cases = {c["id"]: c for c in agent_eval_cases.build_cases()}
     ids = [s.strip() for s in args.case_ids.split(",") if s.strip()]
     if ids == ["all"]:
         ids = list(all_cases)
