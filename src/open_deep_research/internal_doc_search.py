@@ -20,6 +20,7 @@ from chromadb.utils import embedding_functions
 from langchain_core.tools import tool
 
 from open_deep_research.hybrid_retrieval import hybrid_rank
+from open_deep_research.rerank import make_llm_scorer, rerank
 from open_deep_research.tool_reliability import (
     TRANSIENT_NETWORK_EXCEPTION_TYPES,
     TransientToolError,
@@ -48,6 +49,38 @@ INTERNAL_DOC_SEARCH_TIMEOUT_SECONDS = 15
 # 结果的数据结构和距离字段，而不是给 BM25-only 的结果伪造一个距离。
 HYBRID_ENV_VAR = "INTERNAL_DOC_HYBRID_SEARCH"
 HYBRID_CANDIDATE_POOL_MAX = 50
+
+
+# LLM 重排——默认关闭，INTERNAL_DOC_RERANK=1 启用（会多一次 LLM 调用）。
+# 启用时先取 RERANK_CANDIDATES 个候选（混合检索开启则是混合排序后的前 N 个），
+# 重排后截取 n_results。重排失败自动降级为原顺序。模型由 INTERNAL_DOC_RERANK_MODEL 指定。
+RERANK_ENV_VAR = "INTERNAL_DOC_RERANK"
+RERANK_MODEL_ENV_VAR = "INTERNAL_DOC_RERANK_MODEL"
+RERANK_CANDIDATES = 10
+_rerank_scorer_override = None  # 测试注入假 scorer 用
+
+
+def _rerank_enabled() -> bool:
+    return os.environ.get(RERANK_ENV_VAR, "").strip() == "1"
+
+
+def _get_rerank_scorer():
+    if _rerank_scorer_override is not None:
+        return _rerank_scorer_override
+    model = os.environ.get(RERANK_MODEL_ENV_VAR, "").strip()
+    if not model:
+        from open_deep_research.configuration import Configuration
+
+        model = Configuration().summarization_model
+    return make_llm_scorer(model)
+
+
+def _reorder(results: dict, idx: list[int]) -> dict:
+    out = dict(results)
+    for key in ("ids", "documents", "metadatas", "distances"):
+        if out.get(key) is not None:
+            out[key] = [[results[key][0][i] for i in idx]]
+    return out
 
 
 def _hybrid_enabled() -> bool:
@@ -90,6 +123,9 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
     execute_tool_safely 用的 internal_doc_search_tool_call 不转换（让重试
     判断能看到真实异常类型，而不是解析字符串前缀）。
     """
+    rerank_on = _rerank_enabled()
+    fetch_n = max(n_results, RERANK_CANDIDATES) if rerank_on else n_results
+
     def _run_search():
         client = chromadb.PersistentClient(path=CHROMA_DIR)
         openai_ef = embedding_functions.OpenAIEmbeddingFunction(
@@ -100,12 +136,12 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
             "company_knowledge_base", embedding_function=openai_ef
         )
         if not _hybrid_enabled():
-            return collection.query(query_texts=[query], n_results=n_results)
+            return collection.query(query_texts=[query], n_results=fetch_n)
         total = collection.count()
         if total == 0:
-            return collection.query(query_texts=[query], n_results=n_results)
-        pool = min(total, max(HYBRID_CANDIDATE_POOL_MAX, n_results))
-        return _apply_hybrid(collection.query(query_texts=[query], n_results=pool), query, n_results)
+            return collection.query(query_texts=[query], n_results=fetch_n)
+        pool = min(total, max(HYBRID_CANDIDATE_POOL_MAX, fetch_n))
+        return _apply_hybrid(collection.query(query_texts=[query], n_results=pool), query, fetch_n)
 
     try:
         results = await asyncio.wait_for(
@@ -134,6 +170,17 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
 
     if not results["ids"][0]:
         return "No relevant documents found in the internal knowledge base."
+
+    if rerank_on:
+        try:
+            scorer = _get_rerank_scorer()
+        except Exception:  # noqa: BLE001 - 构造模型失败（缺 key 等）同样降级为不重排
+            scorer = None
+        if scorer is None:
+            results = _reorder(results, list(range(len(results["ids"][0])))[:n_results])
+        else:
+            rr = await rerank(query, results["documents"][0], scorer, top_n=n_results)
+            results = _reorder(results, rr.order)
 
     output_lines = []
     for i in range(len(results["ids"][0])):
