@@ -324,6 +324,18 @@ class Configuration(BaseModel):
             }
         }
     )
+    research_model_fallback: Optional[str] = Field(
+        default=None,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "description": (
+                    "备用研究模型（可选，默认不启用）。主模型在连接失败、超时、限流或服务端 5xx "
+                    "（且 with_retry 重试耗尽）后才会改用它；认证失败、参数错误等请求类错误不会降级。"
+                )
+            }
+        }
+    )
     research_model_max_tokens: int = Field(
         default=10000,
         metadata={

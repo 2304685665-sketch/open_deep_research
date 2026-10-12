@@ -47,6 +47,7 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.model_fallback import ainvoke_with_fallback
 from open_deep_research.skills import skills_enabled, skills_prompt_for
 from open_deep_research.state import (
     AgentInputState,
@@ -493,7 +494,26 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
     
     # Step 3: Generate researcher response with system context
     messages = [SystemMessage(content=researcher_prompt)] + researcher_messages
-    response = await research_model.ainvoke(messages)
+    if configurable.research_model_fallback:
+        fallback_model = (
+            configurable_model
+            .bind_tools(tools)
+            .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+            .with_config({
+                **research_model_config,
+                "model": configurable.research_model_fallback,
+                "api_key": get_api_key_for_model(configurable.research_model_fallback, config),
+            })
+        )
+        response, served_by = await ainvoke_with_fallback(
+            [("primary", research_model), ("fallback", fallback_model)], messages
+        )
+        if served_by != "primary":
+            logging.getLogger(__name__).warning(
+                "researcher served by fallback model %s", configurable.research_model_fallback
+            )
+    else:
+        response = await research_model.ainvoke(messages)
     
     # Step 4: Update state and proceed to tool execution
     return Command(
