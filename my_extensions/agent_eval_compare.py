@@ -15,6 +15,10 @@ def stats(d):
           cost=c["model_calls"]["cost_usd"],wall=f.get("wall_clock_seconds"),
           ung=bool(ev.get("ungrounded_figures",{}).get("dates") or ev.get("ungrounded_figures",{}).get("amounts"))))
     return s,rows
+def usage(rows):
+    n=len(rows) or 1
+    return dict(model_calls_per_case=sum(r["calls"] for r in rows)/n, cost_per_case_usd=sum(r["cost"] for r in rows)/n,
+                sql_calls_per_case=sum(r["sql"] or 0 for r in rows)/n)
 def agg(rows):
     by=collections.defaultdict(lambda:[0,0,0])
     for r in rows:
@@ -26,6 +30,7 @@ if __name__=="__main__":
     sa,ra=stats(a)
     print("A",a,"guard_env=",repr(sa["settings"]["grounding_guard_env"]),"cost",sa["budget"]["actual_usd"],"calls",sa["budget"]["calls_ok"],"tripped",sa["budget"]["tripped"],"abort",sa["budget_aborted"],"secret",sa["secret_scan_hits"])
     for k,v in sorted(agg(ra).items()): print("  ",k,"pass",v[1],"/",v[0],"valid",v[2])
+    print("  limits",sa["settings"].get("extra_config") or "Configuration defaults","usage",{k:round(v,4) for k,v in usage(ra).items()})
     ic=collections.Counter(i for r in ra for i in r["issues"]); print("  issues",dict(ic)); print("  ungrounded cases",[r["id"] for r in ra if r["ung"]])
     print("  invalid",[(r["id"],r["status"]) for r in ra if not r["valid"]])
     print("  failed",[r["id"] for r in ra if r["valid"] and not r["passed"]])
@@ -33,6 +38,7 @@ if __name__=="__main__":
         sb,rb=stats(b)
         print("B",b,"guard_env=",repr(sb["settings"]["grounding_guard_env"]),"cost",sb["budget"]["actual_usd"],"calls",sb["budget"]["calls_ok"],"tripped",sb["budget"]["tripped"],"abort",sb["budget_aborted"],"secret",sb["secret_scan_hits"],"code",sa["code_version"]==sb["code_version"])
         for k,v in sorted(agg(rb).items()): print("  ",k,"pass",v[1],"/",v[0],"valid",v[2])
+        print("  limits",sb["settings"].get("extra_config") or "Configuration defaults","usage",{k:round(v,4) for k,v in usage(rb).items()})
         ic=collections.Counter(i for r in rb for i in r["issues"]); print("  issues",dict(ic)); print("  ungrounded cases",[r["id"] for r in rb if r["ung"]])
         print("  failed",[r["id"] for r in rb if r["valid"] and not r["passed"]])
         A={r["id"]:r for r in ra}; B={r["id"]:r for r in rb}
