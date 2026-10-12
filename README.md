@@ -147,3 +147,38 @@ The `src/legacy/` folder contains two earlier implementations that provide alter
 - **Parallel Processing**: Multiple researchers work simultaneously
 - **Speed Optimized**: Faster report generation through concurrency
 - **MCP Support**: Extensive Model Context Protocol integration
+
+---
+
+## 本 fork 的扩展（相对上游）
+
+本仓库 fork 自 [langchain-ai/open_deep_research](https://github.com/langchain-ai/open_deep_research)，上游基线为提交 `1b7d2e8`（2026-08-10）。
+下表区分**上游已有**与**本 fork 新增或修改**；每一项的证据、测试与已知限制见 [EVIDENCE.md](EVIDENCE.md)。
+带“默认关闭”的功能需要通过配置或环境变量显式开启，关闭时行为与未加该功能时一致。
+
+| 能力 | 上游已有 | 本 fork 新增或修改 |
+|---|---|---|
+| 研究工作流（clarify → brief → supervisor → researcher → compress → report） | ✅ LangGraph supervisor/researcher 多智能体 | 未改动编排结构；在 researcher / report 节点上挂接下列能力 |
+| 多智能体并行研究 | ✅ | — |
+| MCP **客户端**（调用外部 MCP 服务） | ✅ `langchain-mcp-adapters` | — |
+| MCP **服务端**（对外暴露工具） | ❌ | `mcp_server.py`：只读 `sql_executor` 与 `internal_doc_search`（不暴露 `python_executor`） |
+| 内部工具 | ❌ | `sql_executor`（只读 SQLite，连接层 `mode=ro`）、`python_executor`（Docker 沙箱）、`internal_doc_search`（Chroma） |
+| 工具调用可靠性 | 仅有最简 `execute_tool_safely` | 类型化异常重试、熔断、外层超时、失败分类 |
+| 降级披露与引用核验 | ❌ | 降级事件记录与报告披露；URL 引用核验；内部文档 doc_id 溯源核验 |
+| 运行追踪 / 循环检测 | ❌ | 本地 JSONL trace（默认关闭）；重复/ABAB 循环检测（默认关闭）；逐次失败归因脚本 |
+| 跨会话记忆 | ❌ | `memory_manager`（mem0 封装）；记忆写入/读取准入过滤（默认关闭） |
+| 文档摄取 | ❌ | Markdown/PDF 解析、页眉页脚清理、分块（不含 OCR） |
+| 检索 | ❌ | 可选 BM25+RRF（默认关闭；仅在向量候选池内重排）；可选 LLM Rerank（默认关闭，失败回退原顺序） |
+| Skill | ❌ | `skills/*/SKILL.md` 加载、校验、触发词匹配并注入 researcher 提示词（默认关闭） |
+| 模型降级 | ❌ | 备用研究模型（默认不启用；仅连接/超时/限流/5xx 才切换） |
+| 人工审批 | ❌ | 工具执行前审批闸门（`python_executor`、引用 ≥2 表的 SQL；默认关闭） |
+| 服务化 | ❌ | FastAPI + Redis：异步任务、幂等、限流、状态查询、SSE 状态流、指标端点、简易 Web 控制台 |
+| 评测 | ❌ | SQL 攻击/正常/资源矩阵；Agent 评测用例（期望值由 SQLite 现算）与确定性判分器；检索评测脚本与 v1 查询集（草稿，未审核未运行） |
+| CI | ❌ | GitHub Actions 运行离线测试脚本（尚未在真实 Actions 上验证） |
+
+### 不要从这张表里读出的结论
+
+- 功能存在 ≠ 效果已验证。检索（混合检索、Rerank）目前**没有任何效果数据**；检索评测的查询集尚未审核、尚未运行。
+- 容器化部署文件（`deploy/`）尚未在真实 Docker 环境构建验证。
+- 服务层任务是进程内 asyncio 任务，**进程重启不会恢复运行中的任务**。
+- 合成故障注入、规则型过滤等结果均为离线测试，不代表线上表现。
