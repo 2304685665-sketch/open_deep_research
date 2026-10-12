@@ -75,6 +75,9 @@ jobs:
             test_api_service_faults \
             test_eval_retrieval_v2 \
             test_agent_security_matrix \
+            test_sim_session_fault_injection \
+            test_eval_memory_filter \
+            test_sql_guard_cases \
             test_memory_guard \
             test_attribute_failures \
             test_api_service \
