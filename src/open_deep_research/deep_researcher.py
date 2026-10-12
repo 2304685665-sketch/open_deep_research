@@ -21,7 +21,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from open_deep_research import run_trace
+from open_deep_research import approval, run_trace
 from open_deep_research.citation_verification import (
     extract_internal_doc_ids,
     verify_citations,
@@ -628,6 +628,21 @@ async def execute_tool_safely(
     base_delay = configurable.tool_retry_base_delay_seconds if configurable else 0.5
 
     tool_name = tool.name if hasattr(tool, "name") else "<unknown>"
+
+    # 人工审批闸门（默认关闭）：被拒绝/超时/没有审批代理时，这次调用不执行。
+    # 归为 tool_input_error（不是基础设施故障），因此不计入熔断，也不重试。
+    if configurable is not None and getattr(configurable, "human_approval_enabled", False):
+        allowed, decision = await approval.gate(
+            tool_name, args, float(getattr(configurable, "human_approval_timeout_seconds", 300))
+        )
+        if not allowed:
+            msg = f"Tool call not executed: human approval {decision} for '{tool_name}'."
+            run_trace.emit("tool_start", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=1, params=args)
+            run_trace.emit("tool_end", config=config, research_topic=research_topic,
+                            tool=tool_name, attempt=1, duration_ms=0.0, status="error",
+                            failure_kind="tool_input_error", output=msg)
+            return msg, "error", "tool_input_error", 1
     raising_call = _RETRY_AWARE_TOOL_CALLS.get(tool_name) if tool_name else None
 
     if raising_call is None:

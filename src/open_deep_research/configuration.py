@@ -336,6 +336,31 @@ class Configuration(BaseModel):
             }
         }
     )
+    human_approval_enabled: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "是否对高风险工具调用启用人工审批（python_executor 的代码、引用 >=2 张表的 SQL）。"
+                    "需要先用 approval.set_broker() 设置审批代理；启用但没有代理时，需审批的调用一律不执行。"
+                )
+            }
+        }
+    )
+    human_approval_timeout_seconds: int = Field(
+        default=300,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "number",
+                "default": 300,
+                "min": 5,
+                "max": 3600,
+                "description": "等待人工审批的最长时间（秒）；超时按未批准处理，该次调用不执行。"
+            }
+        }
+    )
     research_model_max_tokens: int = Field(
         default=10000,
         metadata={
