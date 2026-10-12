@@ -16,7 +16,7 @@
 相同：模型 `openai:gpt-4.1-mini`（四个角色）、`--search-api none`、`--memory off`、同一 53 条用例与评分器（v1 预注册为主，v2 事后重评为辅）、`MEMORY_GUARD` 与 `DEEP_RESEARCH_GROUNDING_GUARD` 均不设置（关闭）。
 
 ## 分步与停止规则（预算：累计费用上限 $8，此前已花约 $1.3）
-1. 先对 A 做 **5 条试跑**（固定：latest-RoboWorks, cmp-most-total, avg-RoboWorks, absent-company, since2026-sum），`--budget-usd 0.60`。用实测的每条费用外推 53 条总费用。
+1. 先对 A 做 **5 条试跑**（固定：latest-RoboWorks, cmp-most-total, avg-RoboWorks, absent-company, since2026-sum），`--budget-usd 1.00`（运行前修订：原为 0.60；默认配置每条费用未知，担心封顶过紧导致后续用例被拦、数据不完整；这只改封顶，不改用例、评分或比较方式）。用实测的每条费用外推 53 条总费用。
 2. 外推总费用 ≤ $3.0 才继续跑 A 的 53 条（`--budget-usd 3.5`）；否则停止，把结果如实记为“默认配置在预算内跑不完 53 条”，只报告试跑数据。
 3. 再跑 B2 的 53 条（`--budget-usd 1.0`）。
 4. 任何一次触发预算刹车、`budget_aborted`、密钥扫描命中或数据库哈希变化：该臂标记不完整，不得与完整臂直接比较。
@@ -35,7 +35,7 @@ export ODR_EVAL_CONFIRM_LIVE=yes
 # 步骤1：A 的 5 条试跑
 .venv/bin/python my_extensions/agent_eval_run.py --live --model openai:gpt-4.1-mini --max-cases 5 \
   --case-ids latest-RoboWorks,cmp-most-total,avg-RoboWorks,absent-company,since2026-sum \
-  --budget-usd 0.60 --out-dir my_extensions/eval_results/limits_A_defaults_pilot
+  --budget-usd 1.00 --out-dir my_extensions/eval_results/limits_A_defaults_pilot
 # 步骤2（仅当外推 ≤ $3.0）
 .venv/bin/python my_extensions/agent_eval_run.py --live --model openai:gpt-4.1-mini --max-cases 53 --case-ids all \
   --budget-usd 3.5 --out-dir my_extensions/eval_results/limits_A_defaults_full
