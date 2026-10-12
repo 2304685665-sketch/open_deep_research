@@ -2,10 +2,14 @@
 
 设计取舍（先读这里）：
 - create_app(redis, runner, settings) 全部依赖注入：测试用 fakeredis 与假 runner，不碰真实 Redis/模型。
-- 异步任务 = 进程内 asyncio.Task + Redis 里持久化任务状态。**进程重启会丢掉正在跑的任务**
-  （状态会停在 running）；没有独立的 worker/队列，所以这不是分布式任务队列，横向扩展靠多实例共享
-  同一个 Redis 的"状态与幂等/限流计数"，而不是共享执行。要做到重启可续跑，需要 checkpointer + 任务回收，
-  不在本模块范围内。
+- 异步任务 = 进程内 asyncio.Task + Redis 里持久化任务状态。**进程重启会丢掉正在跑的任务**，
+  任务不会续跑（续跑需要 checkpointer，不在本模块范围内）。为避免状态永远停在 running：执行中每
+  heartbeat_seconds 刷新一次 updated_at；pending/running 且超过 stale_after_seconds 没有刷新、并且不是本进程
+  正在执行的任务，在被查询（状态/事件流/幂等重放）时标记为 failed（OrphanedTask）。这是读时懒回收，
+  不是调度器；多实例共享 Redis 时依赖心跳而非进程内集合，且回收与"恰好刚完成"之间存在极小的竞态窗口。
+- Redis 故障：最终状态写回有有限次重试（指数退避）；仍失败时任务停在 running 直到被回收为 failed，
+  结果丢失（不会假装成功）。接口遇到 RedisError 返回 503（带 Retry-After），不返回内部细节。指标计数是尽力而为，
+  失败不影响任务状态。
 - 幂等：Idempotency-Key + 请求体哈希。同一 key 同一请求体返回同一个 task_id，不重复执行；同一 key
   不同请求体返回 409。用 SET NX 抢占，两个并发的相同请求只有一个会真正创建任务。
 - 限流：按调用方（X-API-Key，没有则客户端 IP）固定窗口计数。固定窗口在窗口边界处允许最多 2×上限的突发，
@@ -30,6 +34,7 @@ from typing import Awaitable, Callable, Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,11 @@ class Settings:
     max_question_chars: int = 4000
     clock: Callable[[], float] = time.time  # 测试注入；用于按天统计活跃调用方
     duration_samples: int = 200
+    # 可靠性：写回状态重试、心跳、孤儿任务回收。stale_after_seconds 必须明显大于 heartbeat_seconds。
+    write_retries: int = 3
+    write_retry_delay_seconds: float = 0.2
+    heartbeat_seconds: float = 30.0
+    stale_after_seconds: float = 120.0
 
 
 class ResearchRequest(BaseModel):
@@ -85,8 +95,53 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
             return None
         return {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items()}
 
+    async def _set_retry(tid: str, **fields) -> bool:
+        for attempt in range(max(1, st.write_retries)):
+            try:
+                await _set(tid, **fields)
+                return True
+            except RedisError as e:
+                logger.warning("task %s state write failed (attempt %d): %s", tid, attempt + 1, type(e).__name__)
+                if attempt + 1 < st.write_retries:
+                    await asyncio.sleep(st.write_retry_delay_seconds * (2 ** attempt))
+        logger.error("task %s: giving up writing %s after %d attempts", tid, fields.get("status"), st.write_retries)
+        return False
+
     async def _incr(name: str):
-        await redis.incr(f"metrics:{name}")
+        try:
+            await redis.incr(f"metrics:{name}")
+        except RedisError:  # 指标尽力而为，不影响任务状态
+            logger.warning("metrics counter %s not updated", name)
+
+    local_ids: set[str] = set()  # 本进程正在执行的任务 id
+
+    async def _reclaim_if_stale(tid: str, data: Optional[dict]) -> Optional[dict]:
+        if not data or data.get("status") not in ("pending", "running") or tid in local_ids:
+            return data
+        try:
+            last = float(data.get("updated_at") or data.get("created_at") or 0)
+        except ValueError:
+            last = 0.0
+        if time.time() - last <= st.stale_after_seconds:
+            return data
+        latest = await _get(tid)  # 重新读取一次，缩小竞态窗口
+        if not latest or latest.get("status") not in ("pending", "running"):
+            return latest
+        if float(latest.get("updated_at") or latest.get("created_at") or 0) != last:
+            return latest
+        await _set(tid, status="failed",
+                   error="OrphanedTask: no heartbeat from any worker (process restarted or storage was unavailable); result lost")
+        await _incr("failed")
+        await _incr("orphaned_reclaimed")
+        return await _get(tid)
+
+    async def _heartbeat(tid: str):
+        while True:
+            await asyncio.sleep(st.heartbeat_seconds)
+            try:
+                await _set(tid, status="running")
+            except RedisError:
+                logger.warning("task %s heartbeat failed", tid)
 
     def _day(offset: int = 0) -> str:
         return time.strftime("%Y%m%d", time.gmtime(st.clock() - offset * 86400))
@@ -120,23 +175,40 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
         await redis.ltrim("metrics:durations_ms", 0, st.duration_samples - 1)
 
     async def _execute(tid: str, question: str):
-        async with sem:
-            await _set(tid, status="running")
-            t0 = time.monotonic()
-            try:
-                result = await runner(question)
-                await _set(tid, status="succeeded", result=result)
-                await _incr("succeeded")
-            except asyncio.CancelledError:
-                await _set(tid, status="failed", error="CancelledError: task cancelled")
-                await _incr("failed")
-                raise
-            except Exception as e:  # noqa: BLE001
-                logger.exception("task %s failed", tid)
-                await _set(tid, status="failed", error=f"{type(e).__name__}: {str(e)[:200]}")
-                await _incr("failed")
-            finally:
-                await _record_duration((time.monotonic() - t0) * 1000)
+        local_ids.add(tid)
+        hb: Optional[asyncio.Task] = None
+        try:
+            async with sem:
+                if not await _set_retry(tid, status="running"):
+                    return  # 存储不可用：不执行（避免做了一堆事却无处记录），状态留给回收逻辑
+                hb = asyncio.create_task(_heartbeat(tid))
+                t0 = time.monotonic()
+                try:
+                    result = await runner(question)
+                    if await _set_retry(tid, status="succeeded", result=result):
+                        await _incr("succeeded")
+                except asyncio.CancelledError:
+                    await _set_retry(tid, status="failed", error="CancelledError: task cancelled")
+                    await _incr("failed")
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("task %s failed", tid)
+                    if await _set_retry(tid, status="failed", error=f"{type(e).__name__}: {str(e)[:200]}"):
+                        await _incr("failed")
+                finally:
+                    try:
+                        await _record_duration((time.monotonic() - t0) * 1000)
+                    except RedisError:
+                        pass
+        finally:
+            if hb is not None:
+                hb.cancel()
+            local_ids.discard(tid)
+
+    @app.exception_handler(RedisError)
+    async def _redis_unavailable(request: Request, exc: RedisError):
+        logger.error("redis error on %s: %s", request.url.path, type(exc).__name__)
+        return JSONResponse({"detail": "storage unavailable, retry later"}, status_code=503, headers={"Retry-After": "5"})
 
     @app.get("/healthz")
     async def healthz():
@@ -170,6 +242,7 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
                 prior_id, _, prior_hash = prior.partition(":")
                 if prior_hash != bh:
                     raise HTTPException(status_code=409, detail="Idempotency-Key reused with a different request body")
+                await _reclaim_if_stale(prior_id, await _get(prior_id))  # 重放前先回收死任务，客户端会看到 failed
                 await _incr("idempotent_replays")
                 return JSONResponse({"task_id": prior_id, "status_url": f"/research/{prior_id}", "idempotent_replay": True}, status_code=202)
 
@@ -183,7 +256,7 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
     @app.get("/research/{task_id}")
     async def get_research(task_id: str, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
         await _authenticate(x_api_key)
-        data = await _get(task_id)
+        data = await _reclaim_if_stale(task_id, await _get(task_id))
         if data is None:
             raise HTTPException(status_code=404, detail="task not found")
         data.pop("question", None)
@@ -199,7 +272,7 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
             last = None
             deadline = time.monotonic() + st.sse_max_seconds
             while time.monotonic() < deadline:
-                data = await _get(task_id)
+                data = await _reclaim_if_stale(task_id, await _get(task_id))
                 status = (data or {}).get("status")
                 if status != last:
                     last = status
