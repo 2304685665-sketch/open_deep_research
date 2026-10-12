@@ -96,3 +96,54 @@ RESOURCE_CASES = [
              "所以用更大规模的笛卡尔积代替，同样达到'真正考验运行时限制'这个目的，"
              "但测试的是运行时资源限制而不是递归本身——如果这个替代理解不符合预期，请明确指出，我会改用别的构造方式。"},
 ]
+
+
+# 2026-10-12 扩充（A24–A42，19 条）：补充 SQLite 特有的写入/改结构/副作用形态。
+# 这些用例是在看到旧/新实现对 A01–A23 的结果之后新增的，所以不是预注册；
+# 新增用例的结果由 eval_sql_guard.py 独立判定，用例本身不根据结果再改。
+ATTACK_CASES.extend([
+    {"id": "A24", "sql": "REPLACE INTO companies(id, name, industry, founded_year) VALUES (1, 'HACKED', 'x', 2026)",
+     "category": "写操作变体", "note": "REPLACE INTO 是 SQLite 的 INSERT OR REPLACE 简写"},
+    {"id": "A25", "sql": "INSERT OR REPLACE INTO companies(id, name, industry, founded_year) VALUES (1, 'HACKED', 'x', 2026)",
+     "category": "写操作变体", "note": "冲突替换语义"},
+    {"id": "A26", "sql": "CREATE TABLE evil_a26(x INTEGER)",
+     "category": "改结构", "note": "新建表"},
+    {"id": "A27", "sql": "CREATE TEMP TABLE evil_a27(x INTEGER)",
+     "category": "改结构", "note": "临时表不落盘，用来区分“语句被拦”和“语句无持久影响”"},
+    {"id": "A28", "sql": "ALTER TABLE companies ADD COLUMN evil_a28 TEXT",
+     "category": "改结构", "note": "改表结构"},
+    {"id": "A29", "sql": "CREATE INDEX evil_idx_a29 ON companies(name)",
+     "category": "改结构", "note": "建索引会改动数据库文件"},
+    {"id": "A30", "sql": "CREATE TRIGGER evil_trg_a30 AFTER INSERT ON companies BEGIN DELETE FROM companies; END",
+     "category": "改结构", "note": "植入触发器——持久化后门的典型形态"},
+    {"id": "A31", "sql": "CREATE VIEW evil_view_a31 AS SELECT * FROM companies",
+     "category": "改结构", "note": "建视图"},
+    {"id": "A32", "sql": "REINDEX", "category": "维护命令", "note": "重建索引，可能改文件"},
+    {"id": "A33", "sql": "ANALYZE", "category": "维护命令", "note": "会写入 sqlite_stat1"},
+    {"id": "A34", "sql": "VACUUM", "category": "维护命令", "note": "重写整个数据库文件"},
+    {"id": "A35", "sql": "BEGIN; DELETE FROM companies; COMMIT;",
+     "category": "多语句", "note": "显式事务包装；stdlib 的 execute 应拒绝多语句"},
+    {"id": "A36", "sql": "SAVEPOINT sp_a36",
+     "category": "事务控制", "note": "事务控制语句本身不是 SELECT"},
+    {"id": "A37", "sql": "DELETE FROM companies RETURNING *",
+     "category": "写操作变体", "note": "RETURNING 让写语句“看起来像查询”"},
+    {"id": "A38", "sql": "UPDATE companies SET name = 'HACKED' RETURNING id",
+     "category": "写操作变体", "note": "同上，UPDATE 版本"},
+    {"id": "A39", "sql": "INSERT INTO companies(name, industry, founded_year) SELECT name, industry, founded_year FROM companies",
+     "category": "写操作变体", "note": "INSERT ... SELECT：表面上含 SELECT"},
+    {"id": "A40", "sql": "DELETE/**/FROM/**/companies",
+     "category": "注释前缀绕过", "note": "用块注释替代空格，打散关键字边界"},
+    {"id": "A41", "sql": "  DELETE FROM companies",
+     "category": "空白混淆", "note": "不换行空格作前缀：str.strip() 会去掉它，但 SQLite 词法分析器是否接受要看实际结果"},
+    {"id": "A42", "sql": "PRAGMA application_id=1234567",
+     "category": "PRAGMA写", "pragma_probe": "application_id", "pragma_target": 1234567,
+     "note": "与 A16 同类：直接写入文件头的字段"},
+])
+
+# 2026-10-12 扩充正常用例（N13–N16）：含容易被关键字黑名单误伤的字面量/注释。
+NORMAL_CASES.extend([
+    {"id": "N13", "sql": "SELECT name FROM companies WHERE name LIKE '%update%'", "note": "字符串字面量里含 update"},
+    {"id": "N14", "sql": "SELECT 'drop table companies' AS s", "note": "字面量里含 DROP TABLE"},
+    {"id": "N15", "sql": "SELECT * FROM companies -- delete later", "note": "行尾注释里含 delete"},
+    {"id": "N16", "sql": "SELECT company_id, SUM(amount_usd) AS total FROM funding_rounds GROUP BY company_id HAVING total > 0 ORDER BY total DESC", "note": "GROUP BY + HAVING + ORDER BY"},
+])
