@@ -39,6 +39,7 @@ from open_deep_research.tool_reliability import (
     TRANSIENT_NETWORK_EXCEPTION_TYPES,
     NonRetryableInfrastructureError,
 )
+from open_deep_research.write_intent import build_write_request_hint
 from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
@@ -1533,7 +1534,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     cleared_state = {"notes": {"type": "override", "value": []}}
     degradation_events = state.get("degradation_events", [])
     findings = ("\n".join(notes) + _build_degradation_prompt_hint(degradation_events)
-                + _build_grounding_prompt_hint())
+                + _build_grounding_prompt_hint()
+                + build_write_request_hint(state.get("messages", [])))
 
     # Step 2: Configure the final report generation model
     configurable = Configuration.from_runnable_config(config)

@@ -79,6 +79,7 @@ jobs:
             test_eval_memory_filter \
             test_sql_guard_cases \
             test_data_faithfulness_prompt \
+            test_write_intent \
             test_memory_guard \
             test_attribute_failures \
             test_api_service \
