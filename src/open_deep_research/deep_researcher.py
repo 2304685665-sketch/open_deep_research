@@ -47,6 +47,7 @@ from open_deep_research.prompts import (
     research_system_prompt,
     transform_messages_into_research_topic_prompt,
 )
+from open_deep_research.skills import skills_enabled, skills_prompt_for
 from open_deep_research.state import (
     AgentInputState,
     AgentState,
@@ -474,6 +475,13 @@ async def researcher(state: ResearcherState, config: RunnableConfig) -> Command[
         mcp_prompt=configurable.mcp_prompt or "", 
         date=get_today_str()
     )
+    # Skill 注入（默认关闭，DEEP_RESEARCH_SKILLS=1 才启用）：按研究主题关键词挑选流程规范。
+    if skills_enabled() and researcher_messages:
+        first = researcher_messages[0]
+        topic_text = first.content if isinstance(getattr(first, "content", None), str) else ""
+        extra = skills_prompt_for(topic_text)
+        if extra:
+            researcher_prompt = researcher_prompt + "\n\n" + extra
     
     # Configure model with tools, retry logic, and settings
     research_model = (
