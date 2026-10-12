@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from typing import Iterable
 
 GUARD_ENV_VAR = "MEMORY_GUARD"
@@ -48,6 +49,21 @@ _CN_ID_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
 _CARD_RE = re.compile(r"(?<!\d)(?:\d[ \-]?){13,19}(?!\d)")
 
 
+# 常见的西里尔 / 希腊字母“形近字”折叠成拉丁字母，仅用于匹配（不改写要保存的原文）。
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i", "ј": "j", "ѕ": "s",
+    "ο": "o", "α": "a", "ε": "e", "ι": "i", "ν": "v", "ρ": "p", "τ": "t",
+})
+
+
+def _normalize(text: str) -> str:
+    """匹配前的归一化：NFKC（全角→半角等）、去掉零宽/格式字符、折叠常见形近字。
+    只用于规则匹配；不能识别释义改写、编码（base64）、字符间插空格等规避手法。"""
+    t = unicodedata.normalize("NFKC", text)
+    t = "".join(ch for ch in t if unicodedata.category(ch) != "Cf")
+    return t.translate(_CONFUSABLES)
+
+
 def guard_enabled() -> bool:
     return os.environ.get(GUARD_ENV_VAR, "").strip() == "1"
 
@@ -74,11 +90,14 @@ def _has_card_number(text: str) -> bool:
 
 
 def contains_injection(text: str) -> bool:
-    return any(r.search(text) for r in _INJECTION_RE)
+    n = _normalize(text)
+    return any(r.search(text) or r.search(n) for r in _INJECTION_RE)
 
 
 def contains_sensitive(text: str) -> bool:
-    return any(r.search(text) for r in _SECRET_RE) or bool(_CN_ID_RE.search(text)) or _has_card_number(text)
+    n = _normalize(text)
+    return (any(r.search(text) or r.search(n) for r in _SECRET_RE)
+            or bool(_CN_ID_RE.search(n)) or _has_card_number(n))
 
 
 def admit_write(text: str) -> tuple[bool, str]:

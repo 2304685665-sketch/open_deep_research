@@ -34,11 +34,24 @@ APPROVED, DENIED, TIMEOUT = "approved", "denied", "timeout"
 _TABLE_RE = re.compile(r"\b(?:from|join)\s+([a-zA-Z_][\w]*)", re.I)
 
 
+_FROM_CLAUSE_RE = re.compile(
+    r"\bfrom\s+(.+?)(?=\bwhere\b|\bgroup\b|\border\b|\blimit\b|\bhaving\b|\bunion\b|\bon\b|\bjoin\b|\)|;|$)",
+    re.I | re.S)
+
+
 def referenced_tables(query: str) -> set[str]:
-    # 去掉字符串字面量与注释，避免 'from x' 之类的文本误判
+    # 去掉字符串字面量与注释，避免 'from x' 之类的文本误判；去掉标识符引号；
+    # 识别 JOIN 的表，以及 FROM a, b 这种逗号式隐式连接。仍是正则，不是 SQL 解析器。
     q = re.sub(r"'(?:[^']|'')*'", "''", query or "")
     q = re.sub(r"--[^\n]*|/\*.*?\*/", " ", q, flags=re.S)
-    return {t.lower() for t in _TABLE_RE.findall(q)}
+    q = q.replace('"', "").replace("`", "")
+    tables = {t.lower() for t in _TABLE_RE.findall(q)}
+    for clause in _FROM_CLAUSE_RE.findall(q):
+        for item in clause.split(","):
+            m = re.match(r"\s*([a-zA-Z_][\w]*)", item)
+            if m:
+                tables.add(m.group(1).lower())
+    return tables
 
 
 def classify(tool_name: str, args: dict) -> str:

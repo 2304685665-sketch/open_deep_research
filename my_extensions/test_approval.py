@@ -26,7 +26,7 @@ def test_policy_table():
         ("sql_executor", {"query": "SELECT * FROM companies"}, ap.AUTO),
         ("sql_executor", {"query": "SELECT name, sql FROM sqlite_master WHERE type='table'"}, ap.AUTO),
         ("sql_executor", {"query": "SELECT * FROM companies c JOIN funding_rounds f ON f.company_id=c.id"}, ap.REQUIRE),
-        ("sql_executor", {"query": "select * from a, b"}, ap.AUTO),  # 逗号连接不被正则识别——已知局限，见下一个测试
+        ("sql_executor", {"query": "select * from a, b"}, ap.REQUIRE),  # 逗号式隐式连接：加固后可识别
         ("sql_executor", {"query": "SELECT * FROM companies WHERE name='x from y'"}, ap.AUTO),
         ("sql_executor", {"query": "SELECT * FROM companies -- join funding_rounds"}, ap.AUTO),
         ("sql_executor", {"query": "SELECT * FROM companies UNION SELECT * FROM funding_rounds"}, ap.REQUIRE),
@@ -38,10 +38,15 @@ def test_policy_table():
     print("✅ test_policy_table 通过")
 
 
-def test_known_limitation_comma_join_not_detected():
-    # 诚实记录：逗号式隐式连接 FROM a, b 不会被识别为两张表。审批策略不是安全边界，只是风险提示。
-    assert ap.referenced_tables("select * from a, b") == {"a"}
-    print("✅ test_known_limitation_comma_join_not_detected 通过")
+def test_comma_join_and_quoted_identifiers_are_detected():
+    # 修复前：FROM a, b 只识别出 {"a"}，带引号的表名识别不出；现在都能识别。仍是正则，不是 SQL 解析器。
+    assert ap.referenced_tables("select * from a, b") == {"a", "b"}
+    assert ap.referenced_tables("select * from a x, b y where x.i=y.i") == {"a", "b"}
+    assert ap.referenced_tables('select * from "a" c join "b" f on 1=1') == {"a", "b"}
+    assert ap.referenced_tables("select * from a where id in (select id from b)") == {"a", "b"}
+    assert ap.referenced_tables("select 'from x, y' as t from a") == {"a"}
+    assert ap.classify("sql_executor", {"query": "select * from a, b"}) == ap.REQUIRE
+    print("✅ test_comma_join_and_quoted_identifiers_are_detected 通过")
 
 
 def test_gate_auto_no_broker_and_decisions():
