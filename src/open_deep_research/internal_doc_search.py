@@ -19,6 +19,7 @@ load_dotenv()
 from chromadb.utils import embedding_functions
 from langchain_core.tools import tool
 
+from open_deep_research.hybrid_retrieval import hybrid_rank
 from open_deep_research.tool_reliability import (
     TRANSIENT_NETWORK_EXCEPTION_TYPES,
     TransientToolError,
@@ -34,6 +35,40 @@ CHROMA_DIR = os.path.join(
 # 的调用无限期占着"的折衷值，和 sql_executor 的 5s、python_executor 的 15s
 # 属于同一量级，不是精确调优过的数字。
 INTERNAL_DOC_SEARCH_TIMEOUT_SECONDS = 15
+
+# 混合检索（向量候选池 + BM25 重排，RRF 融合）——默认关闭，环境变量
+# INTERNAL_DOC_HYBRID_SEARCH=1 才启用。关闭时检索路径与启用前完全一致（同一个
+# collection.query 调用、不额外调用 count()/Embedding）。
+#
+# 设计取舍（必须随代码一起理解）：BM25 只在"向量检索取回的候选池"里重排，候选池上限
+# HYBRID_CANDIDATE_POOL_MAX 个 chunk（且不超过 collection 总数）。这不是完整的双路
+# 召回：纯 BM25 能命中、但没进向量候选池的 chunk 无法参与。这样做是为了让每个返回的
+# chunk 都有真实的向量距离，保持 "[Source: ..., relevance_distance: ...]" 头行格式不变，
+# 因而 T3b 的 doc_id 提取与引用核验无需改动。要做真正的双路召回，需要重新设计候选
+# 结果的数据结构和距离字段，而不是给 BM25-only 的结果伪造一个距离。
+HYBRID_ENV_VAR = "INTERNAL_DOC_HYBRID_SEARCH"
+HYBRID_CANDIDATE_POOL_MAX = 50
+
+
+def _hybrid_enabled() -> bool:
+    return os.environ.get(HYBRID_ENV_VAR, "").strip() == "1"
+
+
+def _apply_hybrid(results: dict, query: str, n_results: int) -> dict:
+    """对一次向量查询结果（候选池）做 BM25+RRF 重排，取前 n_results 个，保持原有字典结构，
+    每个 chunk 保留自己的向量距离。不引入候选池之外的 chunk。"""
+    ids = results["ids"][0]
+    if not ids:
+        return results
+    docs = results["documents"][0]
+    order = hybrid_rank(query, ids, docs, vector_ranked_ids=ids, top_n=n_results)
+    pos = {cid: i for i, cid in enumerate(ids)}
+    idx = [pos[cid] for cid in order]
+    out = dict(results)
+    for key in ("ids", "documents", "metadatas", "distances"):
+        if out.get(key) is not None:
+            out[key] = [[results[key][0][i] for i in idx]]
+    return out
 
 INTERNAL_DOC_SEARCH_DESCRIPTION = (
     "Search the company's internal document knowledge base (company introductions, "
@@ -64,7 +99,13 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
         collection = client.get_collection(
             "company_knowledge_base", embedding_function=openai_ef
         )
-        return collection.query(query_texts=[query], n_results=n_results)
+        if not _hybrid_enabled():
+            return collection.query(query_texts=[query], n_results=n_results)
+        total = collection.count()
+        if total == 0:
+            return collection.query(query_texts=[query], n_results=n_results)
+        pool = min(total, max(HYBRID_CANDIDATE_POOL_MAX, n_results))
+        return _apply_hybrid(collection.query(query_texts=[query], n_results=pool), query, n_results)
 
     try:
         results = await asyncio.wait_for(
