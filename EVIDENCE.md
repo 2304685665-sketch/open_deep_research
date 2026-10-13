@@ -399,3 +399,9 @@
 - **离线真库测试**（沙箱内真实 PostgreSQL 16 + pgvector 0.6.0，不是 mock；`test_pgvector_store.py` 4 个）：排序与 numpy 精确余弦（并列稳定）一致；SQL `WHERE doc_id = ANY(...)` 元数据过滤后再排序（Faiss 做不到的能力）；重复建表幂等；非法表名被拒。CI 已加入 pgvector 官方镜像的服务容器运行这些测试（尚待推送后确认其通过）。
 - **等价性检验**（`eval_pgvector_equivalence.py`，判据运行前写在脚本头部；真实 embedding，约 $0.0002；第一次运行因 OpenAI 请求 `ConnectTimeout` 中断，改为批量取查询向量并加重试后重跑，判据未改）：对 87 条查询用 pgvector 检索 46 个 chunk，首个命中名次与 §34 记录的 `index_v1|*|vector` **逐条相同，差异 0 条**；Hit@1/MRR 完全一致：old_v1 0.593/0.697、heldout 0.375/0.503、new_v3 0.711/0.820。结果 `eval_results/pgvector_equivalence_20261013.json`。
 - **边界**：①46 个 chunk 时优化器走顺序扫描（精确检索），HNSW 索引虽建但未触发，近似检索的召回在更大规模下未测；②没有速度优势，不得写“提速”；③对比对象是纯 Python 余弦的记录值，不是同次运行的 Chroma。
+
+## 42. 额度耗尽导致四个运行作废（2026-10-13，按协议不计分，待重跑）
+- 现象：2026-10-13 14:46–14:55（UTC）账户额度用尽，OpenAI 返回 `429 You have no credits remaining`，随后 Ray 于 22:55（本地）充值，运行才恢复。期间正在运行的四个目录中，`fast_D2`（30 例带模型调用错误）、`fast_D3`（30 例）、`fast_D4`（23 例，运行状态虽为 finished，但这 23 例全部带 `NO_SQL_TOOL_CALL`，是错误被降级路径吞掉所致）、`attack_guarded_v2`（24 例）被污染。
+- 影响：这些目录里的“总调用 13.30→2.54（−81%）”“SQL 调用 0.70”“v1 通过 53→45”**都不是模型行为的度量**，不得引用；所谓调用数大幅下降是请求在 429 处提前结束造成的。已改名为 `*_INVALID_credit_exhausted`，不参与任何统计。
+- 复核：扫描全部 `summary.json` 与各用例的 `model_calls.error`，EVIDENCE 里引用过的运行（`main_final`、`main2_final`、`main2_schema`、`direct_main`、`direct_main2`、`budget_C_react4`、`attack_unguarded`、`heldout4_*` 等）**错误用例均为 0**，不受影响。
+- 处理：按协议重跑，用 `run_rerun.sh` 分档启动并要求启动前核对 Credit balance。优先级：①fast_D4（协议的主要比较）+ gen_G0/G1/G2（泛化检验）；②attack_guarded_v2；③fast_D2/D3（只作分解）。完成前，§39 里“直连模式调用数下降约三成”与 §33.1 里“schema 提示 SQL 调用 −61%”仍是各自**单独**的、干净的结论；二者叠加的效果目前**没有有效数据**。
