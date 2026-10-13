@@ -106,6 +106,50 @@ def read_live_schema(db_path=None) -> str:
     return "\n".join(" ".join(str(r[0]).split()) for r in rows)
 
 
+# ODR_SQL_STATS_FUNCS=1 时，在只读连接上注册统计聚合函数（默认关闭，关闭时与此前行为完全一致）。
+# 动机：eval 里 `L-stats-pstdev` 失败的根因是 SQLite 没有 STDDEV，模型报错后把 SQL 预览里的数字手抄进 python_executor
+# 再算，抄错/漏行导致结果错误（29,826,212 vs 真值 29,629,338）。函数在数据库内对全部行直接计算，不经过模型转抄。
+SQL_STATS_FUNCS_ENABLED = os.environ.get("ODR_SQL_STATS_FUNCS") == "1"
+
+
+class _Agg:
+    """收集非 NULL 数值；空集返回 NULL。样本方差/标准差在 n<2 时返回 NULL（与 PostgreSQL 一致）。"""
+
+    def __init__(self):
+        self.v = []
+
+    def step(self, x):
+        if x is not None:
+            self.v.append(float(x))
+
+
+def _mk(name):
+    import statistics as st
+
+    class A(_Agg):
+        def finalize(self):
+            v = self.v
+            if not v:
+                return None
+            if name == "median":
+                return st.median(v)
+            if name in ("stddev_samp", "stddev", "var_samp") and len(v) < 2:
+                return None
+            return {"stddev_pop": st.pstdev, "stddev_samp": st.stdev, "stddev": st.stdev,
+                    "var_pop": st.pvariance, "var_samp": st.variance}[name](v)
+
+    return A
+
+
+STATS_FUNCTIONS = ("STDDEV_POP", "STDDEV_SAMP", "STDDEV", "VAR_POP", "VAR_SAMP", "MEDIAN")
+
+
+def register_stats_functions(conn):
+    for fn in STATS_FUNCTIONS:
+        conn.create_aggregate(fn, 1, _mk(fn.lower()))
+
+
+
 def build_sql_executor_description(schema_hint: bool = False, db_path=None) -> str:
     """schema_hint=False 时与此前完全一致。schema_hint=True（环境变量 ODR_SQL_SCHEMA_HINT=1）时，
     把实时读到的建表语句放进说明，替换“你不知道 schema，请先查 sqlite_master”那一句。"""
@@ -131,6 +175,12 @@ def build_sql_executor_description(schema_hint: bool = False, db_path=None) -> s
         + sentence +
         "If your query fails, the raw database error will be returned to you -- "
         "read it carefully and correct your next query accordingly."
+        + (
+            " Built-in statistical aggregates are available and computed over ALL matching rows inside the "
+            "database (do not copy numbers into another tool to compute them): "
+            "STDDEV_POP(x), STDDEV_SAMP(x) (alias STDDEV), VAR_POP(x), VAR_SAMP(x), MEDIAN(x); NULLs are ignored."
+            if SQL_STATS_FUNCS_ENABLED else ""
+        )
     )
 
 
@@ -223,6 +273,8 @@ def _run_query_sync(query: str, timeout_seconds: float | None = None) -> str:
     try:
         conn = sqlite3.connect(_build_readonly_uri(db_path), uri=True)
         conn.execute("PRAGMA query_only = ON")
+        if SQL_STATS_FUNCS_ENABLED:
+            register_stats_functions(conn)
         conn.set_authorizer(_deny_attach_and_detach)
 
         deadline = time.monotonic() + effective_timeout
