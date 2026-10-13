@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 
@@ -326,6 +326,36 @@ def create_app(redis, runner: Runner, settings: Optional[Settings] = None, appro
             "daily_active_clients": daily,
             "returning_clients_today": len(set(today) & earlier),
         }
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics_prometheus(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+        """Prometheus 文本格式（0.0.4）。字段与 /metrics/summary 同源（Redis 计数器），不引入 prometheus_client 依赖。
+        鉴权与 summary 一致（X-API-Key）；Prometheus 抓取时用 http_headers 带上该头。"""
+        await _authenticate(x_api_key)
+
+        async def n(name: str) -> int:
+            v = await redis.get(f"metrics:{name}")
+            return int(v) if v else 0
+
+        durs = [float(x) for x in await redis.lrange("metrics:durations_ms", 0, -1)]
+        lines = []
+
+        def counter(name, help_, value):
+            lines.extend([f"# HELP {name} {help_}", f"# TYPE {name} counter", f"{name} {value}"])
+
+        counter("odr_tasks_created_total", "Research tasks accepted.", await n("created"))
+        counter("odr_tasks_succeeded_total", "Research tasks that finished successfully.", await n("succeeded"))
+        counter("odr_tasks_failed_total", "Research tasks that failed.", await n("failed"))
+        counter("odr_idempotent_replays_total", "Requests answered from an idempotency key.", await n("idempotent_replays"))
+        counter("odr_rate_limited_total", "Requests rejected by the rate limiter.", await n("rate_limited"))
+        lines.extend(["# HELP odr_task_duration_ms Recent task duration quantiles (last N samples).",
+                      "# TYPE odr_task_duration_ms summary"])
+        for q in (50, 95):
+            v = _pct(durs, q)
+            if v is not None:
+                lines.append(f'odr_task_duration_ms{{quantile="{q / 100}"}} {v}')
+        lines.append(f"odr_task_duration_ms_count {len(durs)}")
+        return "\n".join(lines) + "\n"
 
     web_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
