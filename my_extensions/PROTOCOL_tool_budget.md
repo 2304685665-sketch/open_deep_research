@@ -25,3 +25,7 @@ unset OPENAI_API_KEY; export ODR_EVAL_CONFIRM_LIVE=yes
 .venv/bin/python my_extensions/agent_eval_run.py --live --model openai:gpt-4.1-mini --max-cases 53 --case-ids all --budget-usd 1.5 --out-dir my_extensions/eval_results/budget_A2_defaults
 .venv/bin/python my_extensions/agent_eval_run.py --live --model openai:gpt-4.1-mini --max-cases 53 --case-ids all --react-calls 4 --budget-usd 1.5 --out-dir my_extensions/eval_results/budget_C_react4
 ```
+
+## 修订（2026-10-13 19:05，运行 C 臂之前追加）
+- 臂 A2 直接使用已完成的 `main_final`（53 条，Configuration 默认值，当前代码，无限流/无无效运行；$0.5803）。理由：协议要求的是“当前代码上的默认值运行”，`main_final` 正是；自上次提交以来行为相关改动只有默认关闭的 `ODR_SQL_SCHEMA_HINT` 开关与 Dockerfile。这样少花一次 $0.6，但**只有一次 A2 运行，没有重复**，同配置的运行间波动仍未单独测量。
+- 只需新跑 C 臂：`--react-calls 4`，输出目录 `budget_C_react4`。
