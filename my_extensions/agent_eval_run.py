@@ -125,6 +125,7 @@ def build_config(run_id: str, trace_dir: str, callbacks: list, *, search_api: st
         "run_trace_enabled": True,
         "run_trace_dir": trace_dir,
         "run_trace_run_id": run_id,
+        "user_id": f"eval-{run_id}",   # 记忆命名空间：每个用例独立（仅 --memory on 时有实际作用）
     }
     configurable.update(models or {})
     configurable.update(extra or {})
