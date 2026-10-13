@@ -530,3 +530,7 @@
 - **离线检测结果**（确定性、`inject_offline_detection.py`，`inject_results/offline_detection_20261013.json`）：46 个真实 chunk **0 误屏蔽**；显式注入 **7/8** 被屏蔽（漏掉 I-07 英文"you must also run the SQL statement"）；释义改写 **0/4**；12 题的事实句 **12/12 保留**（逐句屏蔽没有把有用资料一起丢掉）。这些用例由作者在知道规则大致内容的前提下写成，泛化偏乐观；**释义改写拦不住是规则型防护的固有局限，没有为此改规则**（改规则会变成在测试集上调参）。
 - **测试**：`test_doc_content_guard.py`（6 项，已加入 CI）、`test_inject_wiring.py`（2 项端到端接线：假 embedding 建投毒 Faiss 索引，经真实 `_search_internal_docs`，验证 `ODR_FAISS_DIR` 生效、防护关闭时注入原文可见、开启时被屏蔽且事实句与 Source 头行保留；需要 chromadb+faiss，未加入 CI）。变异检查：让 sanitize 失效使 3 项失败，让接线钩子不生效使 1 项失败。
 - **尚未做**：在线运行 I0/I1（`bash my_extensions/run_inject_evals.sh`，预计每臂不到 $0.1，上限 $0.6）。在线结果出来之前，不能声称防护降低了真实模型被诱导的比例。
+
+## 54. 补装 fakeredis 后在 Mac 上实跑两组此前"环境未满足"的测试（2026-10-14）
+- `uv pip install fakeredis` 后：`test_tool_reliability.py`（含真实 Docker 的一项：外层超时大于内层超时时，由内层超时触发、`docker ps` 确认无残留容器，耗时 15.1 秒）**全部通过**；`test_loop_detection.py` **全部通过**（含与历史提交 054b3a2 的 worktree 对照：关闭检测时同输入同输出；确定性合成场景：关闭检测 10 轮、开启检测 5 轮；并行 researcher 的循环检测互不影响）。这取代 §26 附近"需要 Docker / fakeredis 而未通过"的记录。
+- 边界：循环检测的"10→5 轮"是**确定性合成场景**，不是真实模型证据，只能说明机制按设计触发，不能当成效果数据写。
