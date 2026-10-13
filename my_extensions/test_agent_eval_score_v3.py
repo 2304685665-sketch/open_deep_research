@@ -25,6 +25,14 @@ def test_non_year_counts_unchanged():
     assert not v3.score_case_v3(c, "一共有 13 家公司。", True, [])
 
 
+def test_measure_word_wei_and_others_accepted():
+    c = {"expected": {"kind": "count", "value": 25}}
+    for ans in ("客户总数为 **25位**。", "共有25名客户", "一共 25 条记录", "共 25 人"):
+        assert v3.score_case_v3(c, ans, True, []), ans
+    assert not v3.score_case_v3(c, "客户总数为 24位。", True, [])
+    assert not v3.score_case_v3(c, "没有给出数字", True, [])
+
+
 if __name__ == "__main__":
     for n, f in list(globals().items()):
         if n.startswith("test_"): f(); print("✅", n)
