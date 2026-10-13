@@ -435,3 +435,7 @@
 - 次要：SQL 工具调用 4.11 → 1.38；单例成本 $0.0114 → $0.0037（−68%，p<1e-4）。
 - **质量守门（预先指定：v1 通过数不低于 A0 超过 2 条，且损失的 McNemar p>0.05）：通过**。v1：53 → 56（A0 独有 0 / D4 独有 3，McNemar p=0.25，**不显著**）；v2（事后评分）：58 → 60（1 / 3，p=0.625）。无依据（ungrounded）用例 17 → 11（描述性，未做检验）。
 - 解读边界：质量没有下降，但"通过数上升"在统计上不显著，只能写"未下降"，不能写"提升"。单模型（gpt-4.1-mini）、单次运行、同一批 63 例（schema 提示的机制是在这批题上开发的，泛化套件 gen_G0/1/2 单独验证，见后续章节）。D2/D3 分解与泛化套件待对应运行完成后补。
+
+## 46. Docker 构建与服务启动：在 Mac 上验证通过（2026-10-13，更新 §27）
+- `deploy/Dockerfile.service.uv` + `deploy/docker-compose.service.uv.yml`（用 uv 安装依赖，原 pip 版本在依赖回溯处过慢）：`docker compose build` 成功（441 秒，python:3.12-slim 基础镜像）；`up -d` 后 redis 容器 healthy，`curl localhost:8000/healthz` 返回 `{"status":"ok","redis":"up"}`，即服务容器与**真实 Redis**（非 fakeredis）连通。
+- **没有验证的**：未在容器内跑完整测试套件；未对真实 Redis 做断连/重启故障注入；未用容器发起真实研究任务（会产生 API 费用）；GitHub Actions 是否通过以 Actions 页面为准，这里不声明。§27 中"未能验证"的结论由本节取代，原因是当时的云端环境拦截 Docker Hub，而非构建文件本身有问题。
