@@ -104,6 +104,7 @@ jobs:
             test_mcp_server \
             test_doc_ingest \
             test_eval_retrieval \
+            test_prompt_cache_experiment \
             ; do
             echo "::group::$f"
             python my_extensions/$f.py
