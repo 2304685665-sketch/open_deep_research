@@ -188,6 +188,13 @@ SQL_SCHEMA_HINT_ENABLED = os.environ.get("ODR_SQL_SCHEMA_HINT") == "1"
 SQL_EXECUTOR_DESCRIPTION = build_sql_executor_description(SQL_SCHEMA_HINT_ENABLED)
 
 
+# ODR_SQL_ALLOW_WITH=1（默认关）：WITH 开头的查询不再被分类层拒绝，直接交给只读连接执行。
+# 安全依据不在字符串分类而在数据库层：连接是 mode=ro + PRAGMA query_only=ON + ATTACH/DETACH authorizer，
+# "WITH … DELETE/INSERT/UPDATE" 会被数据库以 "attempt to write a readonly database" 拒绝（实测见
+# my_extensions/PROTOCOL_sql_benign.md 与 test_sql_allow_with.py）。默认关闭是为了保持与旧行为完全一致。
+SQL_ALLOW_WITH = os.environ.get("ODR_SQL_ALLOW_WITH") == "1"
+
+
 def _classify_query(query: str) -> str:
     """返回 'select' / 'with' / 'other'。
 
@@ -308,7 +315,7 @@ def _run_query_sync(query: str, timeout_seconds: float | None = None) -> str:
                 "matched more rows than this limit]"
             )
         return result
-    except sqlite3.Error as e:
+    except (sqlite3.Error, sqlite3.Warning) as e:  # 多语句在 Python<3.12 抛 sqlite3.Warning（不是 Error 子类），3.12+ 抛 ProgrammingError
         if timed_out or "interrupted" in str(e).lower():
             return (
                 "SQL Error: query timed out after approximately "
@@ -338,6 +345,8 @@ async def sql_executor(query: str) -> str:
         return "SQL Error: query must be a non-empty string."
 
     classification = _classify_query(query)
+    if classification == "with" and SQL_ALLOW_WITH:
+        classification = "select"  # 放行到只读连接；写入由数据库层拒绝
     if classification == "with":
         return (
             "SQL Error: WITH (CTE) queries are not currently supported by "
@@ -357,5 +366,5 @@ async def sql_executor(query: str) -> str:
         # 用 asyncio.to_thread 把同步的 sqlite3 调用丢到独立线程跑，
         # 不阻塞主事件循环。
         return await asyncio.to_thread(_run_query_sync, query)
-    except sqlite3.Error as e:
+    except (sqlite3.Error, sqlite3.Warning) as e:  # 多语句在 Python<3.12 抛 sqlite3.Warning（不是 Error 子类），3.12+ 抛 ProgrammingError
         return f"SQL Error: {str(e)}"
