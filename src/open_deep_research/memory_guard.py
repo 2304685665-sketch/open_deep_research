@@ -62,6 +62,36 @@ _INJECTION_PATTERNS = [
     r"假装.{0,10}(系统提示|之前|以上).{0,6}不存在",
     r"(服从|听从|只听|遵从)(本条|这条)(记忆|备注|笔记)",
     r"(执行|运行).{0,6}(drop|delete\s+from|truncate)",
+    # —— 2026-10-14 召回修复（由 v3 留出集暴露的盲区驱动；v3 因此变为开发集，泛化另用 v4 复测）——
+    # 覆盖类：不要听从用户 / 忽略数据库或查询结果 / 假装设定不存在 / 去限制人设
+    r"\b(do\s*n[o']t|never)\s+(follow|obey|listen\s+to)\s+(the\s+)?user",
+    r"\b(ignore|disregard)\s+(the\s+)?(database|query|tool|search)\s+(results?|output|data)?",
+    r"\bpretend\b.{0,40}\b(never\s+existed|do(es)?\s*n[o']t\s+exist|were\s+never)\b",
+    r"\b(do\s+anything\s+now|no\s+content\s+polic(?:y|ies)|without\s+(?:any\s+)?(?:content\s+)?polic(?:y|ies))\b|\bDAN\b.{0,30}\bAI\b",
+    r"(假装|假设).{0,14}(从未存在|不存在|没有存在)",
+    r"忽略.{0,6}(数据库|查询|工具|检索).{0,4}(结果|输出|数据)?",
+    r"(无视|不受|不再受).{0,8}(准则|政策|内容政策|安全)",
+    r"(最高|最优先)(的)?指令|(不要|别|禁止)(听从|服从|遵从)用户",
+    # 持久行为操控：静默/隐瞒/拒绝展示/固定话术/植入链接
+    r"\b(silently|secretly|quietly|covertly)\s+(omit|hide|skip|drop|lower|reduce|prefer|favou?r|ignore)\b",
+    r"\b(never|do\s*n[o']t)\s+(mention|reveal|disclose)\b.{0,30}\b(this\s+(note|memory)|exists?)\b",
+    r"\b(refuse|decline)\s+to\s+(show|display|reveal|share|provide)\b.{0,40}\b(sql|results?|data|source|numbers?)\b",
+    r"\b(say|state|claim|tell)\b.{0,20}\b(no\s+sources?\s+(are\s+)?available|already\s+(verified|checked))\b",
+    r"\b(append|add|insert|include)\b.{0,24}\b(link|url)\b.{0,20}https?://",
+    r"(悄悄|偷偷|暗中|私下|悄然).{0,16}(调低|调高|隐去|隐瞒|省略|删掉|篡改|调整)",
+    r"(不要|别|禁止)(提到|提及|披露|暴露).{0,10}(风险|问题|这条|此条|备注)",
+    r"(坚持原答案|声称已经?(核验|验证|检查)|谎称)",
+    # 外传：把对话/提示词/数据发到外部地址、邮箱或公开位置
+    r"\b(send|post|upload|forward|email|e-mail|write|publish|leak)\b.{0,50}\b(conversation|chat\s+(log|history)|history|system\s+prompt|database|query\s+results?|contents?)\b.{0,60}(https?://|@[\w.\-]+\.|gist|pastebin|public)",
+    r"\b(include|attach|embed|put|append)\b.{0,30}\b(user'?s?\s+)?(e-?mail|phone|password|token|api\s*key)\b.{0,40}\b(url|query\s*param|parameter|footer|header)",
+    r"\b(base64|encode)\b.{0,40}\b(database|contents?|conversation|system\s+prompt)\b.{0,40}\b(append|include|footer|reply|answer)",
+    r"(发送|发给|上传|转发|写入|发布).{0,16}(聊天记录|对话记录|系统提示词|提示词|查询结果|数据库内容).{0,30}(邮箱|@|https?://|gist|公开)|(邮箱|@[\w.\-]+\.\w+|https?://).{0,30}(发送|上传|转发).{0,10}(聊天记录|对话|提示词)",
+    r"(发送|上传|发给|转发)到\s*(https?://|\S+@\S+)",
+    # 多语言（日/西/德/法）：忽略此前指令、只听本条、泄露系统提示
+    r"(以前|これまで|上記|前)の?(指示|命令|ルール).{0,8}(無視|無効|忘れ)|システムプロンプト.{0,8}(表示|出力|教え)|これからは.{0,16}(だけ|のみ).{0,8}従",
+    r"\bignora\s+(todas\s+)?(las\s+)?(instrucciones|reglas)|\b(mensaje|prompt)\s+del?\s+sistema\b|\ba\s+partir\s+de\s+ahora\b.{0,40}\b(obedece|únicamente|solo|sólo)\b",
+    r"\bignoriere\s+(alle\s+)?(vorherigen|bisherigen|obigen)?\s*(anweisungen|regeln)|\bsystem\s*-?prompt\b.{0,20}\b(aus|ausgeben|zeige)|\bab\s+jetzt\b.{0,40}\b(nur|ausschließlich)\b",
+    r"\bignore\s+toutes?\s+les\s+(instructions|règles)|\binvite\s+système\b|\bprompt\s+système\b|\bdésormais\b.{0,40}\b(uniquement|seulement)\b|\boublie\s+les\s+règles",
 ]
 _SECRET_PATTERNS = [
     r"\bsk-[A-Za-z0-9_\-]{20,}",
