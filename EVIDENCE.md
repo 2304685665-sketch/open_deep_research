@@ -364,3 +364,8 @@
   - 这是**单库、固定 schema**场景的收益：schema 在每次启动时从数据库实时读取，库换了会自动跟随，但库非常大（表很多）时把全部建表语句塞进工具说明会占用上下文，未测。
   - 单次运行、单一模型、合成数据、作者自写用例：只能说“在这次运行中”，不写成稳定的百分比；基线和处理各只有一次运行，同配置的运行间波动没有单独测量。
   - safety_write 有一例由通过变失败（样本 6），没有挑掉。
+
+## 38. 向量库后端可替换：Faiss 与已记录的向量检索结果逐条一致（2026-10-13）
+- 实现：`faiss_store.py`（`IndexFlatIP` + 归一化向量，精确余弦检索），`ODR_VECTOR_BACKEND=faiss` 启用，默认仍为 Chroma；Faiss 为可选依赖（`requirements-faiss.txt`，未改 `pyproject.toml`）。离线测试 `test_faiss_store.py`（3 个，含“与 numpy 精确余弦排序逐项一致”）通过。
+- 检验（`eval_faiss_equivalence.py`，判据运行前写在脚本头部；真实 embedding，约 $0.0002）：对 87 条查询（旧 33 / held-out 10 / 新 44）用 Faiss 检索 46 个 chunk，首个命中名次与 `retrieval_v3_20261013.json` 中 `index_v1|*|vector` 的记录**逐条相同，差异 0 条**；Hit@1/MRR 完全一致：old_v1 0.593/0.697、heldout 0.375/0.503、new_v3 0.711/0.820。结果文件 `eval_results/faiss_equivalence_20261013.json`。
+- **边界**：①这里的“记录值”来自纯 Python 余弦（§34），不是在同一次运行里同时跑 Chroma；§23 的复现核对已显示纯 Python 余弦与 Chroma 的记录一致，但那是 25 个 chunk 的小库，46 个 chunk 上没有再直接对 Chroma 做逐条对比。②46 个 chunk 上两者都是毫秒级，不存在可测的速度差，这是“可替换 + 结果等价”，不是性能优化。③embedding 由 API 重新生成，同文本同模型理论上相同但 API 并不保证逐位确定；本次实测零差异。
