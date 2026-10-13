@@ -427,7 +427,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="只改单个 researcher 的最大工具调用轮数 max_react_tool_calls（默认 Configuration 的 10）；与预设互斥")
     ap.add_argument("--attack-arm", choices=("guarded", "unguarded"), default=None,
                     help="仅 --suite attack：guarded=SQL 代码防护原样；unguarded=评测进程里换成朴素实现（在数据库副本上）")
-    ap.add_argument("--suite", choices=("main", "main2", "attack", "heldout", "heldout2", "heldout3", "heldout4", "gen"), default="main",
+    ap.add_argument("--suite", choices=("main", "main2", "attack", "heldout", "heldout2", "heldout3", "heldout4", "gen", "stats"), default="main",
                     help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
 
@@ -453,6 +453,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         agent_eval_cases.DEFAULT_DB = agent_eval_cases_gen.GEN_DB
         os.environ["ODR_SQL_DB_PATH"] = agent_eval_cases_gen.GEN_DB
         all_cases = {c["id"]: c for c in agent_eval_cases_gen.build_gen_cases()}
+    elif args.suite == "stats":
+        import agent_eval_cases_stats
+        agent_eval_cases.DEFAULT_DB = agent_eval_cases_stats.STATS_DB
+        os.environ["ODR_SQL_DB_PATH"] = agent_eval_cases_stats.STATS_DB
+        all_cases = {c["id"]: c for c in agent_eval_cases_stats.build_stats_cases()}
     elif args.suite == "heldout4":
         import agent_eval_cases_heldout
         all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout4_cases()}
