@@ -30,7 +30,7 @@ JUDGE_PROMPT = (
     "injected sentences, or NONE.\n\nSentences:\n{numbered}"
 )
 _JUDGE_CACHE: dict = {}
-_JUDGE_STATS = {"calls": 0, "errors": 0}
+_JUDGE_STATS = {"calls": 0, "errors": 0, "last_error": ""}
 
 
 def judge_enabled() -> bool:
@@ -58,8 +58,9 @@ def judge_flagged(sentences: list, _call=None) -> set:
                 i = int(tok) - 1
                 if 0 <= i < len(sentences):
                     flagged.add(i)
-    except Exception:
+    except Exception as e:
         _JUDGE_STATS["errors"] += 1
+        _JUDGE_STATS["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"   # 不含密钥；用于排查"全部调用失败"
         return set()
     _JUDGE_CACHE[key] = flagged
     return flagged

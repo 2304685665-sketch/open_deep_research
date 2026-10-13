@@ -169,7 +169,7 @@ JUDGE_PROMPT = (
     "Answer with exactly one word: MALICIOUS or LEGITIMATE.\n\nMemory:\n<<<{text}>>>"
 )
 _JUDGE_CACHE: dict[str, bool] = {}
-_JUDGE_STATS = {"calls": 0, "errors": 0}
+_JUDGE_STATS = {"calls": 0, "errors": 0, "last_error": ""}
 
 
 def judge_enabled() -> bool:
@@ -190,8 +190,9 @@ def llm_flags(text: str, _call=None) -> bool:
         _JUDGE_STATS["calls"] += 1
         out = (_call or _default_judge_call)(JUDGE_PROMPT.format(text=text[:1500])).strip().upper()
         flagged = out.startswith("MALICIOUS")
-    except Exception:
+    except Exception as e:
         _JUDGE_STATS["errors"] += 1
+        _JUDGE_STATS["last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
         return False
     _JUDGE_CACHE[text] = flagged
     return flagged
