@@ -49,8 +49,9 @@ def build_index(directory: str, ids: list[str], documents: list[str], metadatas:
 
 
 class FaissCollection:
-    def __init__(self, directory: str = DEFAULT_DIR, embed: EmbedFn = openai_embed):
+    def __init__(self, directory: str | None = None, embed: EmbedFn = openai_embed):
         import faiss
+        directory = directory or os.environ.get("ODR_FAISS_DIR") or DEFAULT_DIR   # ODR_FAISS_DIR：评测用，指向被投毒的副本索引
         self._index = faiss.read_index(os.path.join(directory, "index.faiss"))
         meta = json.load(open(os.path.join(directory, "meta.json"), encoding="utf-8"))
         self._ids, self._docs, self._metas = meta["ids"], meta["documents"], meta["metadatas"]
