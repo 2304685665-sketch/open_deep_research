@@ -228,7 +228,7 @@ async def run_case(graph, case: dict, tracker: eval_budget.BudgetTracker, out_di
     first_record = len(tracker.records)
     db_path = db_path or agent_eval_cases.DEFAULT_DB
     if PRE_CASE_HOOK:
-        db_path = PRE_CASE_HOOK(case)
+        db_path = PRE_CASE_HOOK(case) or db_path
     db_before = file_sha256(db_path)
     cb = eval_budget.BudgetCallback(tracker)
     config = build_config(run_id, trace_dir, [cb], search_api=search_api, models=models, extra=extra_config)
@@ -428,6 +428,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="只改单个 researcher 的最大工具调用轮数 max_react_tool_calls（默认 Configuration 的 10）；与预设互斥")
     ap.add_argument("--attack-arm", choices=("guarded", "unguarded"), default=None,
                     help="仅 --suite attack：guarded=SQL 代码防护原样；unguarded=评测进程里换成朴素实现（在数据库副本上）")
+    ap.add_argument("--fault-p", type=float, default=None, help="端到端故障注入：internal_doc_search 每次尝试以该概率抛瞬时错误（见 agent_eval_fault_arm.py）")
+    ap.add_argument("--fault-seed", type=int, default=20261014)
+    ap.add_argument("--fault-retries", type=int, default=None, help="与 --fault-p 合用：覆盖 tool_retry_max_attempts（0=不重试）")
     ap.add_argument("--suite", choices=("main", "main2", "attack", "heldout", "heldout2", "heldout3", "heldout4", "gen", "stats", "inject"), default="main",
                     help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
@@ -503,6 +506,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         extra_config = {"max_react_tool_calls": args.react_calls}
 
+    if args.fault_retries is not None:
+        extra_config = {**extra_config, "tool_retry_max_attempts": args.fault_retries}
     print("== Agent 评测运行计划 ==")
     print(f"用例: {ids}")
     print(f"预算上限: ${args.budget_usd:.2f}（请求前预检 + 响应后核算；不是绝对硬上限，见 eval_budget.py 文档）")
@@ -544,6 +549,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         global PRE_CASE_HOOK, POST_CASE_HOOK
         PRE_CASE_HOOK, POST_CASE_HOOK = agent_eval_attack_arm.make_hooks(
             _se, args.attack_arm or "guarded", agent_eval_cases_large.LARGE_DB, os.path.join(out_dir, "_work"))
+    if args.fault_p is not None:
+        import agent_eval_fault_arm
+        fpre, fpost = agent_eval_fault_arm.install(dr, args.fault_p, args.fault_seed)
+        PRE_CASE_HOOK, POST_CASE_HOOK = agent_eval_fault_arm.chain(PRE_CASE_HOOK, POST_CASE_HOOK, fpre, fpost)
     tracker = eval_budget.BudgetTracker(args.budget_usd)
     summary = asyncio.run(run_batch(dr.deep_researcher, [all_cases[i] for i in ids], tracker, out_dir,
                                     search_api=args.search_api, models=models, timeout_s=args.case_timeout_s,
