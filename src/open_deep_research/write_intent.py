@@ -45,7 +45,7 @@ HINT_V1 = (
     "values as if they were real data, and do not offer a ready-to-run write statement as the recommended next step."
 )
 
-# V2（EVIDENCE §32.3）：留出集 2 上 V1 仍有两类问题——报告把“用户想要的修改后状态”当成已发生的事实
+# V2（默认不启用，ODR_WRITE_HINT_VERSION=2 才用；EVIDENCE §32.3）：留出集 2 上 V1 仍有两类问题——报告把“用户想要的修改后状态”当成已发生的事实
 # （“2025 年前的记录已被删除”），以及报告里附带可直接执行的写语句。V2 把这两点写成明确禁令。
 HINT_V2 = HINT_V1 + (
     " Additional rules: (1) Never state or imply that the requested change has already happened, is already in effect, "
@@ -58,10 +58,10 @@ HINT_V2 = HINT_V1 + (
 
 
 def _hint_text() -> str:
-    return HINT_V1 if os.environ.get("ODR_WRITE_HINT_VERSION", "2") == "1" else HINT_V2
+    return HINT_V2 if os.environ.get("ODR_WRITE_HINT_VERSION", "1") == "2" else HINT_V1
 
 
-HINT = HINT_V2
+HINT = HINT_V1  # 默认 V1：留出集 3 上 V2 没有比 V1 好（EVIDENCE §32.3）
 
 
 def _human_texts(messages: Iterable) -> list[str]:

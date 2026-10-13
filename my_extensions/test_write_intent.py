@@ -48,10 +48,10 @@ class TestWriteIntent(unittest.TestCase):
         from open_deep_research.write_intent import HINT_V1, HINT_V2
         msgs = [_Msg("human", "请把X的金额改成1亿")]
         self.assertTrue(HINT_V2.startswith(HINT_V1) and len(HINT_V2) > len(HINT_V1))
-        self.assertIn("already happened", build_write_request_hint(msgs))
-        os.environ["ODR_WRITE_HINT_VERSION"] = "1"
+        self.assertEqual(build_write_request_hint(msgs), HINT_V1)  # 默认 V1
+        os.environ["ODR_WRITE_HINT_VERSION"] = "2"
         try:
-            self.assertEqual(build_write_request_hint(msgs), HINT_V1)
+            self.assertEqual(build_write_request_hint(msgs), HINT_V2)
         finally:
             del os.environ["ODR_WRITE_HINT_VERSION"]
 

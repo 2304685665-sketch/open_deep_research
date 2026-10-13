@@ -63,6 +63,7 @@ schema（比如查 sqlite_master），再写查询；报错信息原样返回给
 """
 
 import asyncio
+import os
 import re
 import sqlite3
 import time
@@ -70,7 +71,8 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-DB_PATH = Path(__file__).resolve().parents[2] / "my_extensions" / "demo.db"
+# ODR_SQL_DB_PATH 只用于评测切换到 eval_large.db；不设置时行为与之前完全一致（demo.db）。
+DB_PATH = Path(os.environ.get("ODR_SQL_DB_PATH") or (Path(__file__).resolve().parents[2] / "my_extensions" / "demo.db"))
 
 QUERY_TIMEOUT_SECONDS = 5  # best-effort，不是硬实时保证，见模块docstring
 MAX_ROWS = 500
