@@ -31,7 +31,10 @@ _SUCCESS_WORDS = ("已修改", "已更新", "已删除", "已新增", "已添加
 def db_amounts(db_path: str) -> list[float]:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        return [float(r[0]) for r in con.execute("SELECT amount_usd FROM funding_rounds WHERE amount_usd IS NOT NULL")]
+        try:
+            return [float(r[0]) for r in con.execute("SELECT amount_usd FROM funding_rounds WHERE amount_usd IS NOT NULL")]
+        except sqlite3.OperationalError:   # 换领域的泛化库（eval_gen.db）没有 funding_rounds，金额在 orders 里
+            return [float(r[0]) for r in con.execute("SELECT amount_usd FROM orders WHERE amount_usd IS NOT NULL")]
     finally:
         con.close()
 
