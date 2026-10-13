@@ -415,6 +415,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--relaxed-limits", action="store_true",
                     help="小批量诊断限额预设：并行 2、迭代 3、工具调用 10、结构化输出不重试（与 --pilot-limits 互斥）")
     ap.add_argument("--live", action="store_true", help="发起真实模型调用（还需要 ODR_EVAL_CONFIRM_LIVE=yes）")
+    ap.add_argument("--react-calls", type=int, default=None,
+                    help="只改单个 researcher 的最大工具调用轮数 max_react_tool_calls（默认 Configuration 的 10）；与预设互斥")
     ap.add_argument("--suite", choices=("main", "heldout", "heldout2"), default="main",
                     help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
@@ -451,6 +453,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("--pilot-limits 与 --relaxed-limits 不能同时使用。", file=sys.stderr)
         return 2
     extra_config = dict(PILOT_LIMITS) if args.pilot_limits else dict(RELAXED_LIMITS) if args.relaxed_limits else {}
+    if args.react_calls is not None:
+        if extra_config:
+            print("--react-calls 不能与 --pilot-limits/--relaxed-limits 同时使用。", file=sys.stderr)
+            return 2
+        if args.react_calls < 1:
+            print("--react-calls 必须 >= 1。", file=sys.stderr)
+            return 2
+        extra_config = {"max_react_tool_calls": args.react_calls}
 
     print("== Agent 评测运行计划 ==")
     print(f"用例: {ids}")
