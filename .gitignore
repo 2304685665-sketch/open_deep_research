@@ -75,3 +75,6 @@ my_extensions/eval_results/
 # SQLite WAL/SHM sidecar files (never tracked)
 *.db-shm
 *.db-wal
+
+# local key backups (never commit)
+.env.bak*
