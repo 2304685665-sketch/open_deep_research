@@ -604,3 +604,15 @@
 - **通过题数**：v1（预先冻结的评分）56 / 56 / 56；v2 60 / 61 / 61；v3（事后口径）61 / 62 / 62。v3 口径下三次都过 60 题，**三次都不过 0 题**，翻转 3 题；v1 口径下三次都过 55、三次都不过 6、翻转 2 题。也就是说通过率的波动约 ±1 题，v1 的 56/63 并不是运气。
 - **仍然没有测的**：基线（`main2_final`）自己的运行间波动——只有单次运行，所以"基线 59/63（v3）→ D4 61–62/63"的质量差只能说"没有下降"，不能做显著性声明；调用数下降由于幅度远大于 D4 的波动而稳健，但基线端的波动未知。
 - 简历可用口径："同配置重复 3 次，平均每题模型调用 4.40±0.06，较基线 13.3 下降约 67%"。
+
+## 63. 规模化 SQL 写入攻击：361 条（40 种操作 × 9–10 种变形），三个目标（`PROTOCOL_sql_attack_scale.md`，零花费）（2026-10-14）
+| 目标 | 逻辑上改动了数据库 | 基础设施失败 |
+|---|---|---|
+| 当前守卫，`ODR_SQL_ALLOW_WITH=0` | **0 / 361** | 0 |
+| 当前守卫，`ODR_SQL_ALLOW_WITH=1` | **0 / 361** | 0 |
+| 评测专用朴素基线（无 SELECT 白名单、可写连接） | **234 / 361（64.8%）** | 0 |
+- 语料 `sql_attack_corpus.py`（sha256 `ead6c654…45d`）：INSERT/UPDATE/DELETE/REPLACE/DROP/ALTER/CREATE TABLE·INDEX·VIEW·TRIGGER/REINDEX/ANALYZE/VACUUM/VACUUM INTO/PRAGMA writable_schema·user_version·application_id·journal_mode/ATTACH/DETACH/事务语句，× 原样、行注释、块注释、大写、小写、混写、前导空白、`SELECT 1;` 前置、不间断空格、WITH 包装。判定为逻辑改动判据（dump + PRAGMA + 新文件），与守卫自己的分类无关。结果 `sql_attack_scale_results/*.json`。预测（守卫 0、基线大部分改动）在运行前写在协议里，成立；`PRAGMA`、`VACUUM INTO` 等我最不确定的边缘语句守卫也都挡住了。
+- 基线按操作拆分：CREATE 63、ALTER 28、DELETE/INSERT/UPDATE 各 24、PRAGMA 21、ATTACH 14、DROP 14、REPLACE 8、ANALYZE 7、VACUUM 7。
+- **基线里 `SELECT 1; …` 多语句和不间断空格两类变形改动为 0，不是因为基线有防护**：基线用 Python 的单语句 `cursor.execute`，多语句会被标准库直接拒绝，不间断空格是 SQL 语法错误——这是 Python/SQLite 自带的行为，不是 sql_executor 的功劳（`sql_guard_cases.py` 的 A13 注释里也有同样的说明）。
+- 与 §51（42 条：30/42 → 0/42）一致，规模扩大到 361 条后结果相同：**攻击语句 361 → 基线成功 234（64.8%）、守卫 0**。
+- 局限：语料是作者生成的、覆盖 SQLite 常见写入方式但不穷尽（没有测 `load_extension`、虚拟表、`sqlite3` 之外的方言特性）；只测工具层，不测模型是否会写出这些语句（真实模型下见 §58）；基线是我写的评测对照，不是真实某个旧版本。
