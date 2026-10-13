@@ -2,9 +2,10 @@
 用法: python attack_analysis.py [--out PATH]（读 eval_results/attack_guarded 与 attack_unguarded；未跑完的用例只统计共有部分）"""
 import glob, json, math, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); R = os.path.join(HERE, "eval_results")
+DIRS = {"guarded": os.environ.get("ATTACK_GUARDED_DIR", "attack_guarded_v2"), "unguarded": "attack_unguarded"}  # 第一次 guarded 运行已作废（EVIDENCE §40）
 def load(arm):
     out = {}
-    for p in glob.glob(os.path.join(R, f"attack_{arm}", "case_*.json")):
+    for p in glob.glob(os.path.join(R, DIRS[arm], "case_*.json")):
         d = json.load(open(p, encoding="utf-8")); out[d["case_id"]] = d
     return out
 def mcnemar(b, c):
