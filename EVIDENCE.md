@@ -393,3 +393,9 @@
 - **防护臂 `attack_guarded` 第一次运行（$1.4402）作废**：我的评测脚本把 `--out-dir`（相对路径）直接用作数据库副本路径，守卫工具用 `Path.as_uri()` 拼 `mode=ro` URI，相对路径抛 `ValueError`，SQL 工具在该臂**每一次调用都失败**（trace 里全是 `infrastructure_error`，6 条对照只通过 1 条且全部带 `SQL_TOOL_ALL_FAILED`）。所以该臂的“0/42 攻击成功”是工具根本没执行任何查询造成的，**不能当作防护有效的证据**。离线测试没发现是因为测试用的是绝对路径。已修复（`agent_eval_attack_arm.py` 对工作目录取绝对路径）并加回归测试 `test_relative_work_dir_still_works_in_guarded_arm`（在旧代码上复现同一个 ValueError，修复后通过）；作废目录改名为 `attack_guarded_INVALID_relpath_bug`，不参与任何统计。
 - **待补**：防护臂需要重跑（预计 $1.2–1.4）才能得到防护臂的攻击成功数与 McNemar 比较。在此之前，防护层有效性的证据只有离线的 SQL 守卫三版本审计（§SQL，60 例）与 mode=ro 机制本身，不是这次真实模型实验。
 - 累计 API 花费（`summary.json` 汇总，含各次作废运行）约 $9.69，已超过原先设的 $8 确认线，距 $10 总上限约 $0.31；后续任何真实运行须先获 Ray 的新预算授权。
+
+## 41. 向量库后端：pgvector（PostgreSQL 16 + pgvector）与已记录结果逐条一致（2026-10-13）
+- 实现：`pgvector_store.py`（表含 `ord/id/doc_id/section/content/meta jsonb/embedding vector(n)`，HNSW `vector_cosine_ops` 索引，查询 `embedding <=> $q ORDER BY dist, ord`），`ODR_VECTOR_BACKEND=pgvector` 启用，默认仍为 Chroma；`docker-compose.pgvector.yml` 起 `pgvector/pgvector:pg16`；依赖 `psycopg[binary]` 为可选依赖（`requirements-pgvector.txt`）。Faiss 后端保留。
+- **离线真库测试**（沙箱内真实 PostgreSQL 16 + pgvector 0.6.0，不是 mock；`test_pgvector_store.py` 4 个）：排序与 numpy 精确余弦（并列稳定）一致；SQL `WHERE doc_id = ANY(...)` 元数据过滤后再排序（Faiss 做不到的能力）；重复建表幂等；非法表名被拒。CI 已加入 pgvector 官方镜像的服务容器运行这些测试（尚待推送后确认其通过）。
+- **等价性检验**（`eval_pgvector_equivalence.py`，判据运行前写在脚本头部；真实 embedding，约 $0.0002；第一次运行因 OpenAI 请求 `ConnectTimeout` 中断，改为批量取查询向量并加重试后重跑，判据未改）：对 87 条查询用 pgvector 检索 46 个 chunk，首个命中名次与 §34 记录的 `index_v1|*|vector` **逐条相同，差异 0 条**；Hit@1/MRR 完全一致：old_v1 0.593/0.697、heldout 0.375/0.503、new_v3 0.711/0.820。结果 `eval_results/pgvector_equivalence_20261013.json`。
+- **边界**：①46 个 chunk 时优化器走顺序扫描（精确检索），HNSW 索引虽建但未触发，近似检索的召回在更大规模下未测；②没有速度优势，不得写“提速”；③对比对象是纯 Python 余弦的记录值，不是同次运行的 Chroma。
