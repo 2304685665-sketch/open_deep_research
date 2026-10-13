@@ -534,3 +534,7 @@
 ## 54. 补装 fakeredis 后在 Mac 上实跑两组此前"环境未满足"的测试（2026-10-14）
 - `uv pip install fakeredis` 后：`test_tool_reliability.py`（含真实 Docker 的一项：外层超时大于内层超时时，由内层超时触发、`docker ps` 确认无残留容器，耗时 15.1 秒）**全部通过**；`test_loop_detection.py` **全部通过**（含与历史提交 054b3a2 的 worktree 对照：关闭检测时同输入同输出；确定性合成场景：关闭检测 10 轮、开启检测 5 轮；并行 researcher 的循环检测互不影响）。这取代 §26 附近"需要 Docker / fakeredis 而未通过"的记录。
 - 边界：循环检测的"10→5 轮"是**确定性合成场景**，不是真实模型证据，只能说明机制按设计触发，不能当成效果数据写。
+
+## 55. GitHub Actions：离线测试工作流在远程跑通（2026-10-14）
+- 推送 `095bdfc..7aa427d` 后，GitHub Actions 工作流 `Offline tests`（运行 #2，提交 `7aa427d`）**成功完成**（页面显示 completed successfully）。这取代 §25/§27 附近"GitHub Actions 从未在远程跑过"的记录。
+- 边界：工作流只跑离线测试（`.github/workflows/tests.yml` 列出的 45 个左右的测试文件，含本轮新增的统计函数、评分器 v3、逻辑变更判据、检索内容防护等）；需要 Docker、真实 key、chromadb 的测试不在其中（它们在 Mac 上单独实跑，见 §46、§54）。页面上没有取得"通过的用例总数"，所以不写总数。
