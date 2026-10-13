@@ -41,3 +41,28 @@ def test_direct_research_failure_degrades(monkeypatch):
     monkeypatch.setattr(dr.researcher_subgraph, "ainvoke", boom)
     out = asyncio.run(dr.direct_research({"research_brief": "B"}, {"configurable": {}}))
     assert "Error synthesizing" in out["notes"][0]
+
+
+def test_skip_flags_default_off(monkeypatch):
+    monkeypatch.delenv("ODR_SKIP_BRIEF", raising=False); monkeypatch.delenv("ODR_SKIP_COMPRESS", raising=False)
+    assert dr._skip_brief_enabled() is False and dr._skip_compress_enabled() is False
+    monkeypatch.setenv("ODR_SKIP_BRIEF", "1"); monkeypatch.setenv("ODR_SKIP_COMPRESS", "1")
+    assert dr._skip_brief_enabled() is True and dr._skip_compress_enabled() is True
+
+
+def test_last_human_text():
+    from langchain_core.messages import HumanMessage, AIMessage
+    msgs = [HumanMessage(content="first"), AIMessage(content="x"), HumanMessage(content="second")]
+    assert dr._last_human_text(msgs) == "second" and dr._last_human_text([]) == ""
+
+
+def test_skip_compress_makes_no_model_call(monkeypatch):
+    from langchain_core.messages import ToolMessage, AIMessage
+    monkeypatch.setenv("ODR_SKIP_COMPRESS", "1")
+
+    class Boom:
+        def with_config(self, *_a, **_k): raise AssertionError("compression model must not be built")
+    monkeypatch.setattr(dr, "configurable_model", Boom())
+    state = {"researcher_messages": [ToolMessage(content="ROWS", tool_call_id="1"), AIMessage(content="DONE")]}
+    out = asyncio.run(dr.compress_research(state, {"configurable": {}}))
+    assert out["compressed_research"] == "ROWS\nDONE" and out["raw_notes"] == ["ROWS\nDONE"]

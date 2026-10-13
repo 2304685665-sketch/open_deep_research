@@ -81,6 +81,26 @@ configurable_model = init_chat_model(
     configurable_fields=("model", "max_tokens", "api_key"),
 )
 
+
+def _skip_brief_enabled() -> bool:
+    """ODR_SKIP_BRIEF=1（实验性，默认关闭）：不调用模型改写研究简报，直接用用户原话。"""
+    return os.environ.get("ODR_SKIP_BRIEF", "0") == "1"
+
+
+def _skip_compress_enabled() -> bool:
+    """ODR_SKIP_COMPRESS=1（实验性，默认关闭）：researcher 结束后不调用模型压缩，直接把工具输出与最终回答拼接。"""
+    return os.environ.get("ODR_SKIP_COMPRESS", "0") == "1"
+
+
+def _last_human_text(messages) -> str:
+    for m in reversed(messages or []):
+        if getattr(m, "type", None) == "human":
+            c = getattr(m, "content", "")
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in c)
+            return str(c)
+    return ""
+
 async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Command[Literal["write_research_brief", "__end__"]]:
     """Analyze user messages and ask clarifying questions if the research scope is unclear.
     
@@ -187,7 +207,13 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=user_messages_text + remembered_context,
         date=get_today_str()
     )
-    response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
+    if _skip_brief_enabled():
+        # 快速路径：不再调用模型改写简报，直接使用用户最后一条提问（加记忆上下文）作为简报（EVIDENCE §39）
+        class _Brief:  # 与 ResearchQuestion 同名字段，下游只读 research_brief
+            research_brief = _last_human_text(state.get("messages", [])) + remembered_context
+        response = _Brief()
+    else:
+        response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
 
     # 写记忆：只存这次提问本身的原始文本，不存 research_brief（模型生成的、
     # 已经转写过的内容）——避免把模型的转述/推断当成"用户说的事实"存下来，
@@ -1226,6 +1252,14 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     Returns:
         Dictionary containing compressed research summary and raw notes
     """
+    if _skip_compress_enabled():
+        # 快速路径：不调用压缩模型。compressed_research = 各工具输出 + researcher 最后的文字回答；raw_notes 与原实现一致
+        raw_notes_content = "\n".join([
+            str(message.content)
+            for message in filter_messages(state.get("researcher_messages", []), include_types=["tool", "ai"])
+        ])
+        return {"compressed_research": raw_notes_content, "raw_notes": [raw_notes_content]}
+
     # Step 1: Configure the compression model
     configurable = Configuration.from_runnable_config(config)
     synthesizer_model = configurable_model.with_config({
@@ -1237,6 +1271,7 @@ async def compress_research(state: ResearcherState, config: RunnableConfig):
     
     # Step 2: Prepare messages for compression
     researcher_messages = state.get("researcher_messages", [])
+
     
     # Add instruction to switch from research mode to compression mode
     researcher_messages.append(HumanMessage(content=compress_research_simple_human_message))
