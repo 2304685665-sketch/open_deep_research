@@ -139,7 +139,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         )
 
 
-async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
+async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor", "direct_research"]]:
     """Transform user messages into a structured research brief and initialize supervisor.
     
     This function analyzes the user's messages and generates a focused research brief
@@ -204,7 +204,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     )
     
     return Command(
-        goto="research_supervisor", 
+        goto=("direct_research" if _direct_research_enabled() else "research_supervisor"),
         update={
             "research_brief": response.research_brief,
             "supervisor_messages": {
@@ -1517,6 +1517,41 @@ def _append_doc_id_citation_disclosure(final_report_text: str, fetched_doc_ids: 
     return final_report_text + _format_doc_id_citation_disclosure(verification["invalid"])
 
 
+
+def _direct_research_enabled() -> bool:
+    """单研究员直连模式（实验性，默认关闭）：ODR_DIRECT_RESEARCH=1 时跳过 supervisor，
+    由一个 researcher 直接处理研究简报。动机：单库查询类问题经 supervisor 来回约 3 次模型调用，
+    而这类问题不需要并行拆解（EVIDENCE §37）。不适合需要并行多方向网络调研的任务。"""
+    return os.environ.get("ODR_DIRECT_RESEARCH", "0") == "1"
+
+
+async def direct_research(state: AgentState, config: RunnableConfig):
+    """跳过 supervisor：把研究简报原样交给一个 researcher，结果以与 supervisor_tools 相同的方式写入状态。"""
+    brief = state.get("research_brief", "") or ""
+    cfg = config
+    if run_trace.is_enabled(config):
+        cfg = {**config, "configurable": {**config.get("configurable", {}),
+                                          "run_trace_researcher_id": run_trace.new_id()}}
+    try:
+        obs = await researcher_subgraph.ainvoke(
+            {"researcher_messages": [HumanMessage(content=brief)], "research_topic": brief}, cfg)
+    except Exception:
+        return {"notes": ["Error synthesizing research report: Maximum retries exceeded"],
+                "research_brief": brief}
+    update = {"notes": [obs.get("compressed_research", "Error synthesizing research report: Maximum retries exceeded")],
+              "research_brief": brief}
+    raw = "\n".join(obs.get("raw_notes", []))
+    if raw:
+        update["raw_notes"] = [raw]
+    if obs.get("degradation_events"):
+        update["degradation_events"] = list(obs["degradation_events"])
+    if obs.get("fetched_sources"):
+        update["fetched_sources"] = list(obs["fetched_sources"])
+    if obs.get("fetched_doc_ids"):
+        update["fetched_doc_ids"] = list(obs["fetched_doc_ids"])
+    return update
+
+
 async def final_report_generation(state: AgentState, config: RunnableConfig):
     """Generate the final comprehensive research report with retry logic for token limits.
 
@@ -1654,11 +1689,13 @@ deep_researcher_builder = StateGraph(
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # User clarification phase
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # Research planning phase
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
+deep_researcher_builder.add_node("direct_research", direct_research)                # 单研究员直连（ODR_DIRECT_RESEARCH=1，默认不走）
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # Report generation phase
 
 # Define main workflow edges for sequential execution
 deep_researcher_builder.add_edge(START, "clarify_with_user")                       # Entry point
 deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # Research to report
+deep_researcher_builder.add_edge("direct_research", "final_report_generation")      # 直连模式的出口
 deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
 
 # Compile the complete deep researcher workflow
