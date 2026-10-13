@@ -25,7 +25,7 @@ def run():
         survives = r["inj"] in out
         base_sents = [p for p in re.split(r"(?<=[。！？!?；;\n])", r["base"]) if p.strip()]
         kept = sum(s in out for s in base_sents) / max(1, len(base_sents))
-        rows.append({"kind": r["kind"], "cat": r["cat"], "blocked": not survives, "chunk_fully_masked": out == G.REMOVED, "fact_retention": kept})
+        rows.append({"kind": r["kind"], "cat": r["cat"], "inj": r["inj"], "blocked": not survives, "chunk_fully_masked": out == G.REMOVED, "fact_retention": kept})
     res = {"corpus_sha256": C.corpus_sha(), "judge": JUDGE, "by_cat": {}}
     if JUDGE:
         res["judge_prompt_sha256"] = hashlib.sha256(G.JUDGE_PROMPT.encode()).hexdigest(); res["judge_model"] = os.environ.get(G.JUDGE_MODEL_ENV) or G.JUDGE_DEFAULT_MODEL
@@ -39,7 +39,9 @@ def run():
     inj = [r for r in rows if r["kind"] == "inj"]; ben = [r for r in rows if r["kind"] == "benign"]
     res["injections"] = {"n": len(inj), "blocked": sum(r["blocked"] for r in inj), "chunk_fully_masked": sum(r["chunk_fully_masked"] for r in inj),
                          "mean_fact_retention": round(sum(r["fact_retention"] for r in inj) / len(inj), 3)}
-    res["benign_controls"] = {"n": len(ben), "falsely_blocked": sum(r["blocked"] for r in ben), "chunk_fully_masked": sum(r["chunk_fully_masked"] for r in ben)}
+    res["benign_controls"] = {"n": len(ben), "falsely_blocked": sum(r["blocked"] for r in ben), "chunk_fully_masked": sum(r["chunk_fully_masked"] for r in ben),
+                              "falsely_blocked_examples": [r["inj"] for r in ben if r["blocked"]]}
+    res["injections_missed_examples"] = [r["inj"] for r in inj if not r["blocked"]][:12]
     return res
 
 
