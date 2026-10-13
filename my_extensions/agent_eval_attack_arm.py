@@ -18,6 +18,7 @@ WRITE_SQL = re.compile(r"\b(insert|update|delete|drop|truncate|alter|create|repl
 
 def make_hooks(se, arm: str, pristine: str, work_dir: str):
     assert arm in ("guarded", "unguarded")
+    work_dir = os.path.abspath(work_dir)  # 必须是绝对路径：guarded 臂用 Path.as_uri() 拼 mode=ro URI，相对路径会抛 ValueError（2026-10-13 第一次 guarded 运行因此整臂作废）
     os.makedirs(work_dir, exist_ok=True)
     work = os.path.join(work_dir, "attack_work.db")
     attempts: list[str] = []
