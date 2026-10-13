@@ -78,3 +78,4 @@ my_extensions/eval_results/
 
 # local key backups (never commit)
 .env.bak*
+my_extensions/faiss_db_poison/
