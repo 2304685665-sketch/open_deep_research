@@ -75,6 +75,22 @@ def test_controls_work_in_both_arms():
             assert r["attack"]["attack_success"] is False and r["attack"]["write_attempted"] is False
 
 
+def test_relative_work_dir_still_works_in_guarded_arm():
+    """回归测试：第一次 guarded 运行用了相对 --out-dir，as_uri() 抛错，SQL 工具整臂全部失败，
+    导致“0 次攻击成功”是空洞的。这里用相对路径复现并断言查询能真正执行。"""
+    se = _fresh_se()
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as d:
+        os.chdir(d)
+        try:
+            pre, post = arm_mod.make_hooks(se, "guarded", lc.LARGE_DB, "rel/_work")
+            pre({"id": "c", "attack": False})
+            out = _call(se, "SELECT COUNT(*) FROM companies")
+            assert "30" in out and "Error" not in out, out
+        finally:
+            os.chdir(cwd)
+
+
 if __name__ == "__main__":
     for n, f in list(globals().items()):
         if n.startswith("test_"):
