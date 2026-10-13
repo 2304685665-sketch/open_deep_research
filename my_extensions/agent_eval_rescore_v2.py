@@ -11,7 +11,7 @@ def rescore(run_dir):
     # 各套件的用例 id 前缀互不相同（无前缀=main，h-/h2-/h3-=留出集，L-=main2/eval_large.db）
     cases = {}
     for builder in (agent_eval_cases.build_cases, hc.build_heldout_cases, hc.build_heldout2_cases,
-                    hc.build_heldout3_cases, lc.build_large_cases):
+                    hc.build_heldout3_cases, hc.build_heldout4_cases, lc.build_large_cases):
         for c in builder():
             cases[c["id"] if "id" in c else c["case_id"]] = c
     known_demo = v2.db_amounts(agent_eval_cases.DEFAULT_DB)

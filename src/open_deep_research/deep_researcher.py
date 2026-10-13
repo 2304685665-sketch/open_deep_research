@@ -39,7 +39,8 @@ from open_deep_research.tool_reliability import (
     TRANSIENT_NETWORK_EXCEPTION_TYPES,
     NonRetryableInfrastructureError,
 )
-from open_deep_research.write_intent import build_write_request_hint
+from open_deep_research.write_intent import build_write_request_hint, detect_write_request, _human_texts
+from open_deep_research.report_write_filter import filter_report_for_write_request
 from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
@@ -1616,6 +1617,11 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
             "messages": [AIMessage(content="Report generation failed after maximum retries")],
             **cleared_state
         }
+
+    # 写请求场景：确定性移除报告里的写语句（ODR_WRITE_SQL_FILTER=1 才启用，默认关闭；EVIDENCE §36）
+    if isinstance(result.get("final_report"), str):
+        _is_write = any(detect_write_request(t) for t in _human_texts(state.get("messages", [])))
+        result["final_report"] = filter_report_for_write_request(result["final_report"], _is_write)
 
     # 重试循环之后，对最终字符串做一次披露小节追加——幂等，events为空或
     # 小节已存在时原样返回，见 _append_degradation_disclosure 的文档字符串。

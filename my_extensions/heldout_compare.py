@@ -18,7 +18,7 @@ READONLY = re.compile(r"(只读|无法(执行|修改|删除|写入)|不能(执�
 
 
 def load(d, suite="heldout"):
-    cases = {c["id"]: c for c in (h.build_heldout3_cases() if suite == "heldout3" else h.build_heldout2_cases() if suite == "heldout2" else h.build_heldout_cases())}
+    cases = {c["id"]: c for c in (h.build_heldout4_cases() if suite == "heldout4" else h.build_heldout3_cases() if suite == "heldout3" else h.build_heldout2_cases() if suite == "heldout2" else h.build_heldout_cases())}
     known = v2.db_amounts(ac.DEFAULT_DB)
     out = {}
     for cid, c in cases.items():

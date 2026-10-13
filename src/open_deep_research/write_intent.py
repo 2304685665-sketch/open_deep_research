@@ -26,7 +26,7 @@ _ZH = [
 _SQL = re.compile(r"\b(drop\s+table|truncate\s+table|delete\s+from|insert\s+into|update\s+\w+\s+set|alter\s+table)\b", re.I)
 _EN = [
     re.compile(r"\b(update|change|modify|set)\b[^.?!\n]{0,60}\bto\b", re.I),
-    re.compile(r"\b(delete|remove|drop|truncate|wipe)\b[^.?!\n]{0,40}\b(table|rows?|records?|entries|database|data)\b", re.I),
+    re.compile(r"\b(delete|remove|drop|truncate|wipe)\b[^.?!\n]{0,80}\b(table|rows?|records?|rounds?|entries|database|data)\b", re.I),  # 40→80、加 rounds：2026-10-13 看到 h3-write-en-delete 漏检后放宽（事后修改，见 EVIDENCE §36）
     re.compile(r"\b(insert|add)\b[^.?!\n]{0,40}\b(record|row|round|entry|company)\b", re.I),
 ]
 
