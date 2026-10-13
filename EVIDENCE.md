@@ -574,3 +574,15 @@
 - 与调用数下降（13.3→4.46、12.5→4.38）互相印证：Token 和费用的降幅与调用降幅基本同步。结果文件 `token_compare_20261014.json`。
 - 质量口径：main2 上基线 v3 59/63 → D4 v3 61/63；gen 上 35/40 → 40/40（v3 为事后评分口径，见 §50 及评分器审计链）。只能写"质量未下降"，不写"提升"。
 - 局限：Token 为 API 返回的 usage，输入里含自动前缀缓存命中的部分（§48，命中的 token 计费更低，所以费用降幅与 Token 降幅略有差别）；单次运行，运行间波动见重复运行实验（`PROTOCOL_repeat.md`，进行中）。
+
+## 60. SQL 守卫误拦评测（231 条合法只读查询，零花费）与 CTE 误拦修复（`PROTOCOL_sql_benign.md`，运行前冻结）（2026-10-14）
+- **规模**：`sql_benign_corpus.py` 确定性生成 231 条（165 模板 + 28 风格变体 + 25 手写易误拦 + 8 合法 CTE + 5 非 SELECT 只读），冻结 sha256 `9cda9463…81`，直接对真实 `sql_executor` 入口在数据库副本上求值（不调用模型）。此前误拦证据只有 6 条真实模型对照。
+- **基线结果**（预测在运行前写在协议里，全部成立）：主指标 226 条里**误拦 8 条，全部是合法 CTE（`WITH … SELECT`，8/8 被拦）**；模板、风格、易误拦（字符串/别名/注释里含 delete、drop、update 等）共 218 条**0 误拦**；5 条非 SELECT 的只读语句（EXPLAIN/PRAGMA/VALUES/括号）按设计被拦（单列，不计主指标）。结果：`sql_benign_results/baseline_guard_20261014.json`。
+- **诚实的含义**：旧版的"误拦 0"只在没有 CTE 的查询上成立；一旦模型写 `WITH`，守卫会拒绝合法查询（工具设计选择，理由是无法在不解析 SQL 的情况下区分 WITH…SELECT 与 WITH…DELETE）。
+- **改进**（按协议预先声明的三个条件）：新增开关 `ODR_SQL_ALLOW_WITH=1`（默认关，旧行为不变）：WITH 开头的查询放行到只读连接，写入由数据库层拒绝（`attempt to write a readonly database`）。
+  1. 误拦：CTE 8/8 → **0/8**，主指标 8/226 → **0/226**（`sql_benign_results/allow_with_20261014.json`）；
+  2. 安全：42 条攻击（含 A10–A12 的 WITH 包装 DELETE/INSERT/UPDATE）在开关开/关两种设置下**数据库逻辑改动均为 0**，基础设施失败 0（`sql_guard_audit_results/logical_allow_with_{0,1}.json`；dump + PRAGMA 判据）；
+  3. 测试：`test_sql_allow_with.py`（2，已加入 CI）、`test_sql_executor`、`test_sql_reliability`、`test_sql_stats_funcs` 通过。
+- **附带发现并修复的真实缺陷**：在 Python 3.10 下，多语句查询（`SELECT 1; DROP …`）抛 `sqlite3.Warning`（不是 `sqlite3.Error` 子类），旧代码没有捕获，工具调用会直接崩溃（`test_sql_executor` 因此失败）；3.12+ 抛 `ProgrammingError`，所以此前在 3.12/3.13 上没暴露。现在两处 `except` 都捕获 `sqlite3.Warning`。该缺陷只影响拒绝多语句时的报错方式，没有写入风险（多语句本来就没有被执行）。
+- **一个无效的中间结果**：第一次跑逻辑改动检查时我给 `--target` 传了相对路径，42 条全部 `ModuleNotFoundError`，"改动 0 条"是空结果；已删除这两个文件并用绝对路径重跑，上面引用的是重跑结果（基础设施失败 0）。
+- **局限**：语料由作者生成，覆盖面有限，不是对所有合法 SQL 的总体误拦率；开关默认关，评测里 D4 等配置并未开启它，所以"CTE 误拦修复"尚未用真实模型验证对通过率的影响。
