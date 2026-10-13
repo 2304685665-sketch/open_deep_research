@@ -1,11 +1,13 @@
 """间接注入防护规模化离线评测（PROTOCOL_inject_large.md）。用法: python eval_inject_large.py [--out PATH]"""
 import json, os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "..", "src"))
-os.environ.setdefault("OPENAI_API_KEY", "fake-key-for-offline-test")
 JUDGE = "--judge" in sys.argv
+if not JUDGE:
+    os.environ.setdefault("OPENAI_API_KEY", "fake-key-for-offline-test")   # 离线模式：不需要真实密钥
 if JUDGE:   # 会发起真实模型调用（gpt-4.1-mini，每个 chunk 一次），预计 < $0.1
     if os.environ.get("ODR_EVAL_CONFIRM_LIVE") != "yes": raise SystemExit("--judge 需要 ODR_EVAL_CONFIRM_LIVE=yes")
-    from dotenv import load_dotenv; load_dotenv(os.path.join(HERE, "..", ".env"))
+    from dotenv import load_dotenv; load_dotenv(os.path.join(HERE, "..", ".env"))   # 注意：必须在设置任何假密钥之前加载（load_dotenv 默认不覆盖已有变量）
+    if not os.environ.get("OPENAI_API_KEY") or os.environ["OPENAI_API_KEY"].startswith("fake"): raise SystemExit("--judge 需要真实的 OPENAI_API_KEY（从 .env 读取）")
     os.environ["ODR_DOC_LLM_JUDGE"] = "1"
 import hashlib
 import eval_retrieval as ER, inject_corpus_large as C
@@ -29,7 +31,8 @@ def run():
         res["judge_prompt_sha256"] = hashlib.sha256(G.JUDGE_PROMPT.encode()).hexdigest(); res["judge_model"] = os.environ.get(G.JUDGE_MODEL_ENV) or G.JUDGE_DEFAULT_MODEL
     res["real_chunks_modified"] = sum(G.sanitize_chunk(c["text"])[1] > 0 for c in kb)   # 46 个未被投毒的真实 chunk 被改动的数量（误屏蔽）
     if JUDGE:
-        res["judge_calls"] = G._JUDGE_STATS["calls"]; res["judge_errors"] = G._JUDGE_STATS["errors"]
+        res["judge_calls"] = G._JUDGE_STATS["calls"]; res["judge_errors"] = G._JUDGE_STATS["errors"]; res["judge_last_error"] = G._JUDGE_STATS["last_error"]
+        if res["judge_errors"]: print("判别器出错 %d/%d 次（最后一次：%s）：本次作废" % (res["judge_errors"], res["judge_calls"], res["judge_last_error"]), file=sys.stderr)
     for cat in sorted({r["cat"] for r in rows}):
         rs = [r for r in rows if r["cat"] == cat]
         res["by_cat"][cat] = {"n": len(rs), "blocked": sum(r["blocked"] for r in rs)}

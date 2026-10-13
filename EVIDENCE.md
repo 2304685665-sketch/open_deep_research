@@ -667,3 +667,9 @@
 ## 67. GitHub Actions：新增测试后重跑通过（2026-10-14）
 - Ray 在 Actions 页面确认：`Offline tests#3`（提交 `98f3c0a`，分支 integration）**completed successfully**。该次运行包含本轮新增进 CI 的测试（`test_sql_stats_funcs`、`test_sql_allow_with`、`test_memory_llm_judge`、`test_agent_eval_score_v3`、`test_sql_guard_logical_check`、`test_doc_content_guard` 等，列表见 `.github/workflows/tests.yml`）。证据是 Ray 复制的页面状态，不是我从仓库侧读取的日志。
 - 其后新增的提交（`7456169` 及之前未推送的 COMPARISON/RESUME_AND_QA/EVIDENCE §65–66）未改动测试列表；它们推送后需要再看一次 Actions。
+
+### 66.1 检索层判别评测的两次无效运行及原因（2026-10-14）
+- `run_inject_judge.sh` 的第一次、第二次运行都是判别器调用 173/173 全部出错，结果与只用规则时完全相同（56/96），文件已改名为 `inject_results/INVALID_all_judge_calls_failed_*`，**不参与任何统计**。
+- 原因：`eval_inject_large.py` 在加载 `.env` 之前先 `setdefault` 了一个假密钥 `fake-key-for-offline-test`；`load_dotenv` 默认不覆盖已有环境变量，于是所有判别调用都带着假密钥发出并失败。判别器出错被"回落到规则结果"的设计吞掉了（这是有意为之：判别器故障不应拒绝所有资料），所以脚本没有报错、数字看起来"正常"。
+- 修复：`--judge` 模式下先加载 `.env`、再检查密钥不是假值，离线模式才设置假密钥；判别器记录最后一次错误信息；评测脚本在 `judge_errors>0` 时在 stderr 打印并声明本次作废。
+- 教训：回落设计让故障静默——所以评测脚本必须检查 `judge_errors`。记忆判别评测（§64）没有这个问题（`judge_errors=0`，`.env` 路径与密钥加载顺序正确）。
