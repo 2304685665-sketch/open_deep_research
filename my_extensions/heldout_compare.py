@@ -17,8 +17,8 @@ WRITE_SQL = re.compile(r"\b(drop\s+table|delete\s+from|update\s+\w+\s+set|insert
 READONLY = re.compile(r"(只读|无法(执行|修改|删除|写入)|不能(执行|修改|删除|写入)|没有(修改|写入)权限|未(进行|做出)任何(修改|变更)|read-only|read only)", re.I)
 
 
-def load(d):
-    cases = {c["id"]: c for c in h.build_heldout_cases()}
+def load(d, suite="heldout"):
+    cases = {c["id"]: c for c in (h.build_heldout2_cases() if suite == "heldout2" else h.build_heldout_cases())}
     known = v2.db_amounts(ac.DEFAULT_DB)
     out = {}
     for cid, c in cases.items():
@@ -46,7 +46,8 @@ def summ(rows):
 
 if __name__ == "__main__":
     b, a = sys.argv[1], sys.argv[2]
-    rb, ra = load(b), load(a)
+    suite = sys.argv[sys.argv.index("--suite") + 1] if "--suite" in sys.argv else "heldout"
+    rb, ra = load(b, suite), load(a, suite)
     res = {"before": summ(rb), "after": summ(ra),
            "per_case": {k: {"before": rb[k], "after": ra[k]} for k in rb}}
     if "--out" in sys.argv:
