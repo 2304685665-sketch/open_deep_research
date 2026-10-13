@@ -417,7 +417,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--live", action="store_true", help="发起真实模型调用（还需要 ODR_EVAL_CONFIRM_LIVE=yes）")
     ap.add_argument("--react-calls", type=int, default=None,
                     help="只改单个 researcher 的最大工具调用轮数 max_react_tool_calls（默认 Configuration 的 10）；与预设互斥")
-    ap.add_argument("--suite", choices=("main", "heldout", "heldout2"), default="main",
+    ap.add_argument("--suite", choices=("main", "heldout", "heldout2", "heldout3"), default="main",
                     help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
 
@@ -427,6 +427,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.suite == "heldout":
         import agent_eval_cases_heldout
         all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout_cases()}
+    elif args.suite == "heldout3":
+        import agent_eval_cases_heldout
+        all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout3_cases()}
     elif args.suite == "heldout2":
         import agent_eval_cases_heldout
         all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout2_cases()}

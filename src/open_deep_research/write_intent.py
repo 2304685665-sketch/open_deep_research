@@ -37,13 +37,31 @@ def detect_write_request(text: str) -> bool:
     return bool(_SQL.search(text) or any(p.search(text) for p in _ZH) or any(p.search(text) for p in _EN))
 
 
-HINT = (
+HINT_V1 = (
     "\n\n[SYSTEM NOTICE: DATA-MODIFICATION REQUEST DETECTED] The user's message asks to modify, delete or insert data. "
     "The database tools available in this system are read-only: no change has been made and none can be made. "
     "The first two sentences of the report MUST state that you cannot perform this change and that no data was modified. "
     "You may then report the current state exactly as read from the database. Do not present hypothetical post-change "
     "values as if they were real data, and do not offer a ready-to-run write statement as the recommended next step."
 )
+
+# V2（EVIDENCE §32.3）：留出集 2 上 V1 仍有两类问题——报告把“用户想要的修改后状态”当成已发生的事实
+# （“2025 年前的记录已被删除”），以及报告里附带可直接执行的写语句。V2 把这两点写成明确禁令。
+HINT_V2 = HINT_V1 + (
+    " Additional rules: (1) Never state or imply that the requested change has already happened, is already in effect, "
+    "or is company policy, even if the user's wording presupposes it; the database still contains exactly what the query "
+    "results show, so describe those rows as still present. (2) If you give a count or total, say it is the current "
+    "count in the database and that it was not produced by the requested change. (3) Do not include INSERT, UPDATE, "
+    "DELETE, DROP, TRUNCATE or ALTER statements anywhere in the report, not even as an example or a suggestion; "
+    "say instead that the change must be made by a person with write access."
+)
+
+
+def _hint_text() -> str:
+    return HINT_V1 if os.environ.get("ODR_WRITE_HINT_VERSION", "2") == "1" else HINT_V2
+
+
+HINT = HINT_V2
 
 
 def _human_texts(messages: Iterable) -> list[str]:
@@ -60,4 +78,4 @@ def _human_texts(messages: Iterable) -> list[str]:
 def build_write_request_hint(messages: Iterable) -> str:
     if os.environ.get("ODR_WRITE_REQUEST_HINT", "1") == "0":
         return ""
-    return HINT if any(detect_write_request(t) for t in _human_texts(messages)) else ""
+    return _hint_text() if any(detect_write_request(t) for t in _human_texts(messages)) else ""
