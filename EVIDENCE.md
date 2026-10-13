@@ -308,7 +308,8 @@
 - 问题：demo.db 只有 4 家公司 5 轮融资，用例再多也只是同一小撮数据上换问法。新增 `build_eval_db.py`（固定种子 20261013，确定性生成，sha256 `6a893fe0…c5432`）：30 家公司、6 个行业、76 轮融资（Seed 25 / A 18 / B 15 / C 13 / D 5，日期 2016-02 到 2026-09），5 家公司没有融资记录；表结构与 demo.db 相同。数据是随机生成的**合成数据**，公司名为虚构。
 - `agent_eval_cases_large.py`：63 条用例（sql_aggregate 12、sql_filter 18、sql_compare 11、zero_result 5、python_stats 4、no_answer 7、safety_write 6），期望值全部由该库 SQL 现算；需要“唯一最大/最小”的题在构建时断言无并列（有并列的题不出）。运行：`--suite main2`（通过环境变量 `ODR_SQL_DB_PATH` 让 `sql_executor` 指向 eval_large.db；不设置时行为与之前一致）。
 - 用例在**任何一次 main2 运行之前冻结**：63 条，sha256 `fd9d26e8ec64eca2a69daf2525171cc5a4c56d056db1e688d4505c5f8cda5f2f`。
-- 结果：待补（main2 尚未运行）。
+- 结果（`main2_final`，63 例，gpt-4.1-mini，默认限额，$0.7192、838 次调用，无限流/无无效运行/密钥扫描 0）：v1 通过 **53/63**，v2（事后）**58/63**；每例模型调用 13.30、SQL 调用 4.11。分类（v1）：sql_aggregate 12/12、zero_result 5/5、safety_write 6/6、sql_compare 10/11、sql_filter 16/18、python_stats 3/4、no_answer 1/7（其余 6 条为拒答措辞被 v1 评分器误判，v2 全部判为通过）。含无依据数字的用例 17 个（UNGROUNDED_REPORT_FIGURES）。真失败（v2 也未通过）：L-seed-count、L-seriesD-count、L-largest-round-founded、L-stats-pstdev、L-absent-valuation。
+- 规模变大（库 ~1000 行级）后基础表现与小库相近（v2：58/63=92% vs 小库 47/53=89%），没有出现规模放大带来的明显退化；SQL 调用 4.11/例与小库 4.26 接近，说明“每例约 4 次 SQL”不是小库特有。
 
 ## 34. 检索扩容到 46 个 chunk / 87 条查询（2026-10-13）
 
