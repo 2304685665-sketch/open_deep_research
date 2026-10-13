@@ -663,3 +663,7 @@
 - 解读：这套防护在检索层确实能把一半以上的夹带指令在进入上下文前屏蔽，并且不误伤正常的"请于周五前提交"一类内容；但它是规则型的，对改写式（1/12）和行为操控式（4/12）覆盖很差。与记忆过滤的结论一致（§61）：规则型对已知措辞有效、对新措辞泛化差。
 - 这给了"防护效果"一个可量化的口径："注入句进入上下文的比例 96/96 → 40/96"（机制层），而**不是**"模型被诱导率下降"（在线基线本身几乎为 0，§57）。简历里如果写，必须是前者并注明规则型、语料自写。
 - 局限：作者知道规则内容，泛化偏乐观；只测检索层过滤，不测模型行为。
+
+## 67. GitHub Actions：新增测试后重跑通过（2026-10-14）
+- Ray 在 Actions 页面确认：`Offline tests#3`（提交 `98f3c0a`，分支 integration）**completed successfully**。该次运行包含本轮新增进 CI 的测试（`test_sql_stats_funcs`、`test_sql_allow_with`、`test_memory_llm_judge`、`test_agent_eval_score_v3`、`test_sql_guard_logical_check`、`test_doc_content_guard` 等，列表见 `.github/workflows/tests.yml`）。证据是 Ray 复制的页面状态，不是我从仓库侧读取的日志。
+- 其后新增的提交（`7456169` 及之前未推送的 COMPARISON/RESUME_AND_QA/EVIDENCE §65–66）未改动测试列表；它们推送后需要再看一次 Actions。
