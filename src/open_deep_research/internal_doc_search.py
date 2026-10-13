@@ -20,6 +20,7 @@ load_dotenv()
 from chromadb.utils import embedding_functions
 from langchain_core.tools import tool
 
+from open_deep_research import doc_content_guard
 from open_deep_research.hybrid_retrieval import hybrid_rank
 from open_deep_research.rerank import make_llm_scorer, rerank
 from open_deep_research.tool_reliability import (
@@ -189,17 +190,21 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
             rr = await rerank(query, results["documents"][0], scorer, top_n=n_results)
             results = _reorder(results, rr.order)
 
+    _doc_guard_on = doc_content_guard.enabled()   # ODR_DOC_INJECTION_GUARD=1：检索内容间接注入防护（默认关闭）
     output_lines = []
     for i in range(len(results["ids"][0])):
         doc_id = results["metadatas"][0][i]["doc_id"]
         section = results["metadatas"][0][i]["section"]
         distance = results["distances"][0][i]
         text = results["documents"][0][i]
+        if _doc_guard_on:
+            text, _ = doc_content_guard.sanitize_chunk(text)
         output_lines.append(
             f"[Source: {doc_id}, section: {section}, relevance_distance: {distance:.3f}]\n{text}"
         )
 
-    return "\n\n---\n\n".join(output_lines)
+    body = "\n\n---\n\n".join(output_lines)
+    return (doc_content_guard.NOTICE + "\n" + body) if _doc_guard_on else body
 
 
 @tool(description=INTERNAL_DOC_SEARCH_DESCRIPTION)

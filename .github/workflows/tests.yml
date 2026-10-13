@@ -105,6 +105,11 @@ jobs:
             test_doc_ingest \
             test_eval_retrieval \
             test_prompt_cache_experiment \
+            test_sql_stats_funcs \
+            test_agent_eval_cases_stats \
+            test_agent_eval_score_v3 \
+            test_sql_guard_logical_check \
+            test_doc_content_guard \
             ; do
             echo "::group::$f"
             python my_extensions/$f.py
