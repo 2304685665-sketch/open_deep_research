@@ -14,6 +14,7 @@ schema，信息密度高，模型自己探索就够了；这里面对的是非�
 import asyncio
 import os
 import chromadb
+from open_deep_research import faiss_store
 from dotenv import load_dotenv
 load_dotenv()
 from chromadb.utils import embedding_functions
@@ -127,14 +128,17 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
     fetch_n = max(n_results, RERANK_CANDIDATES) if rerank_on else n_results
 
     def _run_search():
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
-        openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-            api_key=os.environ.get("OPENAI_API_KEY"),
-            model_name="text-embedding-3-small",
-        )
-        collection = client.get_collection(
-            "company_knowledge_base", embedding_function=openai_ef
-        )
+        if faiss_store.backend() == "faiss":      # ODR_VECTOR_BACKEND=faiss：可替换向量库后端，其余逻辑不变
+            collection = faiss_store.FaissCollection()
+        else:
+            client = chromadb.PersistentClient(path=CHROMA_DIR)
+            openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                model_name="text-embedding-3-small",
+            )
+            collection = client.get_collection(
+                "company_knowledge_base", embedding_function=openai_ef
+            )
         if not _hybrid_enabled():
             return collection.query(query_texts=[query], n_results=fetch_n)
         total = collection.count()
