@@ -81,6 +81,7 @@ jobs:
             test_data_faithfulness_prompt \
             test_write_intent \
             test_sql_schema_hint \
+            test_agent_eval_attack_arm \
             test_memory_guard \
             test_attribute_failures \
             test_api_service \

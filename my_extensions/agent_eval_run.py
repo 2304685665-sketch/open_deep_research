@@ -214,6 +214,10 @@ def analyze_evidence(trace_dir: str, final_report: str, question: str = "",
     }
 
 
+PRE_CASE_HOOK = None   # 攻击评测用：每条用例前准备数据库副本，返回副本路径
+POST_CASE_HOOK = None  # 攻击评测用：每条用例后写入 attack 字段
+
+
 async def run_case(graph, case: dict, tracker: eval_budget.BudgetTracker, out_dir: str, *,
                    search_api: str = "none", models: Optional[dict] = None, timeout_s: float = 300.0,
                    extra_config: Optional[dict] = None, db_path: Optional[str] = None) -> dict:
@@ -222,6 +226,8 @@ async def run_case(graph, case: dict, tracker: eval_budget.BudgetTracker, out_di
     os.makedirs(trace_dir, exist_ok=True)
     first_record = len(tracker.records)
     db_path = db_path or agent_eval_cases.DEFAULT_DB
+    if PRE_CASE_HOOK:
+        db_path = PRE_CASE_HOOK(case)
     db_before = file_sha256(db_path)
     cb = eval_budget.BudgetCallback(tracker)
     config = build_config(run_id, trace_dir, [cb], search_api=search_api, models=models, extra=extra_config)
@@ -248,6 +254,8 @@ async def run_case(graph, case: dict, tracker: eval_budget.BudgetTracker, out_di
     result["db_sha256_unchanged"] = bool(db_before and db_before == db_after)
     if not result["db_sha256_unchanged"]:
         extra_issues.append("DB_MODIFIED")
+    if POST_CASE_HOOK:
+        POST_CASE_HOOK(case, result)
 
     case_records = tracker.records[first_record:]
     ev = analyze_evidence(trace_dir, final_report, case.get("question", ""), result["started_at"][:10])
@@ -417,7 +425,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--live", action="store_true", help="发起真实模型调用（还需要 ODR_EVAL_CONFIRM_LIVE=yes）")
     ap.add_argument("--react-calls", type=int, default=None,
                     help="只改单个 researcher 的最大工具调用轮数 max_react_tool_calls（默认 Configuration 的 10）；与预设互斥")
-    ap.add_argument("--suite", choices=("main", "main2", "heldout", "heldout2", "heldout3"), default="main",
+    ap.add_argument("--attack-arm", choices=("guarded", "unguarded"), default=None,
+                    help="仅 --suite attack：guarded=SQL 代码防护原样；unguarded=评测进程里换成朴素实现（在数据库副本上）")
+    ap.add_argument("--suite", choices=("main", "main2", "attack", "heldout", "heldout2", "heldout3"), default="main",
                     help="main=原 53 条；heldout=修复前冻结的留出集（agent_eval_cases_heldout.py）")
     args = ap.parse_args(argv)
 
@@ -427,6 +437,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.suite == "heldout":
         import agent_eval_cases_heldout
         all_cases = {c["id"]: c for c in agent_eval_cases_heldout.build_heldout_cases()}
+    elif args.suite == "attack":
+        import agent_eval_cases_attack
+        if not args.attack_arm:
+            print("--suite attack 需要 --attack-arm guarded|unguarded。", file=sys.stderr)
+            return 2
+        all_cases = {c["id"]: c for c in agent_eval_cases_attack.build_attack_cases()}
     elif args.suite == "main2":
         import agent_eval_cases_large
         agent_eval_cases.DEFAULT_DB = agent_eval_cases_large.LARGE_DB
@@ -504,6 +520,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     if problem:
         print("拒绝运行：" + problem, file=sys.stderr)
         return 3
+    if args.suite == "attack":
+        import agent_eval_attack_arm
+        import agent_eval_cases_large
+        from open_deep_research import sql_executor as _se
+        global PRE_CASE_HOOK, POST_CASE_HOOK
+        PRE_CASE_HOOK, POST_CASE_HOOK = agent_eval_attack_arm.make_hooks(
+            _se, args.attack_arm, agent_eval_cases_large.LARGE_DB, os.path.join(out_dir, "_work"))
     tracker = eval_budget.BudgetTracker(args.budget_usd)
     summary = asyncio.run(run_batch(dr.deep_researcher, [all_cases[i] for i in ids], tracker, out_dir,
                                     search_api=args.search_api, models=models, timeout_s=args.case_timeout_s,
