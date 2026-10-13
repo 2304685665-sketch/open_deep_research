@@ -1,9 +1,10 @@
 """pgvector 后端等价性检验（真实 embedding，约 $0.0002）。
-问题：把向量库从 Chroma 换成 pgvector(IndexFlatIP) 后，检索结果是否一致？
+问题：把向量库从 Chroma 换成 pgvector 后，检索结果是否一致？
 预先约定的判据：对 87 条查询（33 旧 + 10 held-out + 44 新），v1 索引文本、向量检索：
  ① pgvector 的首个命中名次与已记录结果 `retrieval_v3_20261013.json`（index_v1|*|vector，纯 Python 余弦）逐条相同；
  ② 三组 Hit@1/MRR 与记录值相同。不同则如实列出差异条目，不做解释性修饰。
-前提: 已有可连接的 PostgreSQL+pgvector（ODR_PG_DSN；docker compose -f deploy/docker-compose.pgvector.yml up -d）。\n用法: EVAL_RETRIEVAL_ALLOW_API=1 python my_extensions/eval_faiss_equivalence.py --allow-api --out PATH"""
+前提: 已有可连接的 PostgreSQL+pgvector（ODR_PG_DSN；docker compose -f deploy/docker-compose.pgvector.yml up -d）。
+用法: EVAL_RETRIEVAL_ALLOW_API=1 python my_extensions/eval_pgvector_equivalence.py --allow-api --out PATH"""
 import argparse, json, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "..", "src"))
 import eval_retrieval as ER, eval_retrieval_v3 as V3
