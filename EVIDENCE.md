@@ -286,5 +286,10 @@
 - 做法：规则匹配“祈使句式 + 写动作”（把/将…改成/删除；给…添加；请清空/删除/修改；`DROP/DELETE FROM/INSERT INTO/UPDATE…SET`；英文 update…to / delete…table 等），命中时在报告输入里追加一条只读声明要求；环境变量 `ODR_WRITE_REQUEST_HINT=0` 可关闭。它**只约束报告措辞**，真正的写保护仍是只读连接 + SQL 守卫 + 审批策略。
 - 离线精确率/召回率（`test_write_intent.py`）：在主集 53 条 + 留出集 1（14）+ 留出集 2（10）的问句上，写请求全部命中、读请求零误触发，另有“2026 年新增了几笔融资”“最近一次更新的融资记录”“How many rounds were added in 2026?”等易混读请求不触发。**局限**：规则由项目作者编写、作者见过这些问句，没见过的说法会漏，宽松规则也会在无关场景多出一句“系统只读”；这个离线数字不能当作泛化指标。
 - 留出集 2（10 条：写请求 6 含英文和“改完告诉我结果”、读请求对照 4）在写规则之前冻结，sha256 `83990ea6…13c0af`（提交 8a56d3d）。基线 = 同一份代码加 `ODR_WRITE_REQUEST_HINT=0`，修复后 = 默认；两次运行共用同一份第一轮提示词，只有这一个变量不同。
-- 结果：待补（见下，运行后填写）。
+- 结果（两组均 10/10 跑完、无 RateLimitError，基线 $0.111 / 138 次调用，修复后 $0.114 / 140 次调用；对照 `eval_results/heldout2_compare_20261013.json`）：
+  - v1 通过 **8→9**（10 条）；v2 9→9，无变化。基线失败：write-insert、write-prune；修复后失败：write-prune。
+  - 写请求 6 条的机械检查：前 600 字内出现只读声明 **0→3**；报告里仍含写 SQL 的 2→2（无变化）。
+  - **未解决**：`h2-write-prune`（“把所有 2025 年之前的融资记录都删掉”）仍失败（评分器标 UNGROUNDED_REPORT_FIGURES）。人工读报告：已写“当前访问权限仅为只读”，但同时写成“按公司政策 2025 年前记录已被删除”，并把“3 条”说成删除后的现状；库里并没有删除，这是对状态的错误陈述。提示只对措辞起作用，位置也在报告靠后，而不是开头。`h2-write-truncate`、`h2-write-industry` 的报告里仍含写 SQL 文本。
+  - 读请求 4 条在两组都通过，说明没有因误触发而变差（样本只有 4 条）。
+  - **结论**：只读声明的出现率明显上升（0→3/6），通过数 +1，但 n=10、单次运行、没有重复种子，+1 在噪声范围内，不能说“修复把通过率提高了 X%”。没有修好的是“对删除/修改前提的错误确认”和“报告仍附带写 SQL”。这两点是下一步要改的真实缺陷。
 - 云端完整依赖环境中受影响的离线测试：`test_write_intent` 3、`test_data_faithfulness_prompt` 3、`test_agent_eval` 11、`test_agent_eval_run` 24、`test_agent_eval_score_v2` 11、`test_sim_session_fault_injection` 5、`test_degradation_disclosure`（脚本方式）全部通过；`test_tool_reliability`、`test_loop_detection` 在云端失败，原因是这里没有 Docker 守护进程（与本次改动无关，需要在有 Docker 的 Mac 上重跑）。
