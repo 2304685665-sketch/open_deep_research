@@ -130,6 +130,9 @@ async def _search_internal_docs(query: str, n_results: int) -> str:
     def _run_search():
         if faiss_store.backend() == "faiss":      # ODR_VECTOR_BACKEND=faiss：可替换向量库后端，其余逻辑不变
             collection = faiss_store.FaissCollection()
+        elif faiss_store.backend() == "pgvector":  # ODR_VECTOR_BACKEND=pgvector：PostgreSQL + pgvector
+            from open_deep_research import pgvector_store
+            collection = pgvector_store.PgVectorCollection()
         else:
             client = chromadb.PersistentClient(path=CHROMA_DIR)
             openai_ef = embedding_functions.OpenAIEmbeddingFunction(

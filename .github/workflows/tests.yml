@@ -27,6 +27,20 @@ jobs:
   offline-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # 真实 PostgreSQL + pgvector：用于 test_pgvector_store（向量库后端的真实数据库测试，不是 mock）
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: odr_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       PYTHONPATH: src
       PYTHONDONTWRITEBYTECODE: "1"
@@ -95,3 +109,14 @@ jobs:
             python my_extensions/$f.py
             echo "::endgroup::"
           done
+
+      - name: pytest 风格的测试（含真实 PostgreSQL + pgvector）
+        env:
+          ODR_PG_TEST_DSN: postgresql://postgres:postgres@localhost:5432/odr_test
+        run: |
+          pip install pytest "psycopg[binary]" faiss-cpu
+          pytest -q -p no:cacheprovider \
+            my_extensions/test_pgvector_store.py \
+            my_extensions/test_faiss_store.py \
+            my_extensions/test_report_write_filter.py \
+            my_extensions/test_direct_research.py
