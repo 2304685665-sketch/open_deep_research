@@ -83,22 +83,59 @@ _LEADING_NOISE_RE = re.compile(r"\A(\s+|--[^\n]*\n?|/\*.*?\*/)+", re.DOTALL)
 _SELECT_RE = re.compile(r"select\b", re.IGNORECASE)
 _WITH_RE = re.compile(r"with\b", re.IGNORECASE)
 
-SQL_EXECUTOR_DESCRIPTION = (
-    "Execute a READ-ONLY SQL query against the internal demo database (SQLite). "
-    "Only SELECT statements are allowed -- PRAGMA, WITH/CTE queries, and any "
-    "write operation (INSERT/UPDATE/DELETE/DROP/etc.) are all rejected. "
-    "The underlying database connection itself is opened read-only (SQLite "
-    "URI mode=ro), so this is enforced at the database layer, not merely by "
-    "inspecting your query text. "
-    f"Results are capped at {MAX_ROWS} rows, and a query will be interrupted "
-    f"if it runs for roughly more than {QUERY_TIMEOUT_SECONDS} seconds "
-    "(best-effort, not a hard guarantee). "
+_NO_SCHEMA_SENTENCE = (
     "You do NOT know the schema in advance -- if you need to know what tables "
     "or columns exist, query `sqlite_master` first (e.g. "
     "\"SELECT name, sql FROM sqlite_master WHERE type='table'\"). "
-    "If your query fails, the raw database error will be returned to you -- "
-    "read it carefully and correct your next query accordingly."
 )
+
+
+def read_live_schema(db_path=None) -> str:
+    """从数据库本身实时读出建表语句（只读连接）；读不到时返回空串，调用方回退到“让模型自己查 sqlite_master”。"""
+    path = Path(db_path) if db_path else DB_PATH
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+    return "\n".join(" ".join(str(r[0]).split()) for r in rows)
+
+
+def build_sql_executor_description(schema_hint: bool = False, db_path=None) -> str:
+    """schema_hint=False 时与此前完全一致。schema_hint=True（环境变量 ODR_SQL_SCHEMA_HINT=1）时，
+    把实时读到的建表语句放进说明，替换“你不知道 schema，请先查 sqlite_master”那一句。"""
+    sentence = _NO_SCHEMA_SENTENCE
+    if schema_hint:
+        schema = read_live_schema(db_path)
+        if schema:
+            sentence = (
+                "The database schema (read from the live database when this tool was created) is:\n"
+                f"{schema}\n"
+                "You do not need to query `sqlite_master` first; write your query directly against these tables. "
+            )
+    return (
+        "Execute a READ-ONLY SQL query against the internal demo database (SQLite). "
+        "Only SELECT statements are allowed -- PRAGMA, WITH/CTE queries, and any "
+        "write operation (INSERT/UPDATE/DELETE/DROP/etc.) are all rejected. "
+        "The underlying database connection itself is opened read-only (SQLite "
+        "URI mode=ro), so this is enforced at the database layer, not merely by "
+        "inspecting your query text. "
+        f"Results are capped at {MAX_ROWS} rows, and a query will be interrupted "
+        f"if it runs for roughly more than {QUERY_TIMEOUT_SECONDS} seconds "
+        "(best-effort, not a hard guarantee). "
+        + sentence +
+        "If your query fails, the raw database error will be returned to you -- "
+        "read it carefully and correct your next query accordingly."
+    )
+
+
+SQL_SCHEMA_HINT_ENABLED = os.environ.get("ODR_SQL_SCHEMA_HINT") == "1"
+SQL_EXECUTOR_DESCRIPTION = build_sql_executor_description(SQL_SCHEMA_HINT_ENABLED)
 
 
 def _classify_query(query: str) -> str:

@@ -381,3 +381,21 @@ Remember, your goal is to create a summary that can be easily understood and uti
 
 Today's date is {date}.
 """
+
+
+_SCHEMA_DISCOVERY_SENTENCE = "You do not know the schema in advance -- query sqlite_master first to discover tables, then write your query."
+_SCHEMA_GIVEN_SENTENCE = "The database schema is given in the tool description, so you do not need to query sqlite_master first; write your query directly."
+
+
+def apply_sql_schema_hint(prompt: str, enabled: bool) -> str:
+    """ODR_SQL_SCHEMA_HINT=1 时，把研究员提示词里“先查 sqlite_master”的指令换成“schema 已在工具说明里”，
+    否则会和注入了 schema 的工具说明互相矛盾。enabled=False 时原样返回。"""
+    if not enabled:
+        return prompt
+    assert _SCHEMA_DISCOVERY_SENTENCE in prompt
+    return prompt.replace(_SCHEMA_DISCOVERY_SENTENCE, _SCHEMA_GIVEN_SENTENCE)
+
+
+import os as _os  # noqa: E402
+
+research_system_prompt = apply_sql_schema_hint(research_system_prompt, _os.environ.get("ODR_SQL_SCHEMA_HINT") == "1")
