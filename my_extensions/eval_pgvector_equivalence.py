@@ -19,7 +19,17 @@ chunks = ER.load_kb_chunks(V3.KB_V3); groups = V3.load_groups()
 rec = json.load(open(os.path.join(HERE, "eval_results", "retrieval_v3_20261013.json"), encoding="utf-8"))["results"]
 PG.build_index([c["id"] for c in chunks], [c["text"] for c in chunks],
                [{"doc_id": c["doc_id"], "section": c["section"]} for c in chunks])
-col = PG.PgVectorCollection()
+# 网络偶发超时（第一次运行在第 N 次逐条 embedding 请求上 ConnectTimeout）：改为一次批量取所有查询向量并带重试；判据不变。
+import time
+_all_q = [q["query"] for qs in groups.values() for q in qs]
+for _try in range(4):
+    try:
+        _vecs = PG.openai_embed(_all_q); break
+    except Exception as e:
+        if _try == 3: raise
+        print(f"embedding 请求失败，重试 {_try + 1}/3：{type(e).__name__}"); time.sleep(3 * (_try + 1))
+_cache = dict(zip(_all_q, _vecs))
+col = PG.PgVectorCollection(embed=lambda texts: [_cache[t] for t in texts])
 out, diffs = {}, []
 for g, qs in groups.items():
     rk = {q["id"]: col.query([q["query"]], n_results=len(chunks))["ids"][0] for q in qs}
