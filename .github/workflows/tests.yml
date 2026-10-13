@@ -108,6 +108,7 @@ jobs:
             test_sql_stats_funcs \
             test_sql_allow_with \
             test_memory_llm_judge \
+            test_doc_llm_judge \
             test_agent_eval_cases_stats \
             test_agent_eval_score_v3 \
             test_sql_guard_logical_check \
